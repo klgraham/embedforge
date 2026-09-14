@@ -46,6 +46,23 @@ login_home() {
 LOGIN_HOME="$(login_home)"
 DEFAULT_USER_CACHE="${CONTROL_EMBED_USER_CACHE:-$LOGIN_HOME/.cache/embedforge}"
 
+normalize_path() {
+  # Collapse repeated slashes so TMPDIR=/var/folders/.../T/ does not fail
+  # doctor by comparing .../T//embedforge-... to Python's .../T/embedforge-...
+  local path="$1"
+  while [[ "$path" == *//* ]]; do
+    path="${path//\/\//\/}"
+  done
+  if [[ "$path" != "/" ]]; then
+    path="${path%/}"
+  fi
+  printf '%s\n' "$path"
+}
+
+same_path() {
+  [[ "$(normalize_path "$1")" == "$(normalize_path "$2")" ]]
+}
+
 usage() {
   cat <<'EOF'
 usage: control-embed <command> [args]
@@ -235,15 +252,15 @@ cmd_doctor() {
   echo "cache_path=$cache_path" >>"$report"
   echo "config_path=$config_path" >>"$report"
 
-  if [[ "$cache_path" != "$XDG_CACHE_HOME/embedforge" ]]; then
+  if ! same_path "$cache_path" "$XDG_CACHE_HOME/embedforge"; then
     echo "FAIL: cache_path is $cache_path; expected $XDG_CACHE_HOME/embedforge" | tee -a "$report"
     fail=1
   fi
-  if [[ "$config_path" != "$XDG_CONFIG_HOME/embedforge/config.toml" ]]; then
+  if ! same_path "$config_path" "$XDG_CONFIG_HOME/embedforge/config.toml"; then
     echo "FAIL: config_path is $config_path; expected $XDG_CONFIG_HOME/embedforge/config.toml" | tee -a "$report"
     fail=1
   fi
-  if [[ "$cache_path" == "$DEFAULT_USER_CACHE" ]]; then
+  if same_path "$cache_path" "$DEFAULT_USER_CACHE"; then
     echo "FAIL: instance shares the user cache $cache_path" | tee -a "$report"
     fail=1
   fi

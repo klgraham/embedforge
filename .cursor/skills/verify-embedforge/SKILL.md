@@ -17,7 +17,7 @@ Linux and macOS are supported. Verify launch → doctor → CLI → cleanup on b
 
 `control-embed` is written for macOS's default Bash 3.2 and BSD userland as well as GNU/Linux. It must not call `getent` on Darwin (stock macOS does not ship it). Login-home lookup uses `dscl` on Darwin, `getent` only when that command exists on other systems, then `~user`. `--help` must succeed when `getent` is absent from `PATH`.
 
-Homebrew `uv` is accepted from `/opt/homebrew/bin/uv` or `/usr/local/bin/uv`. Scratch dirs use `${TMPDIR:-/tmp}` so they follow the platform temp location.
+Homebrew `uv` is accepted from `/opt/homebrew/bin/uv` or `/usr/local/bin/uv`. Scratch dirs use `${TMPDIR:-/tmp}` so they follow the platform temp location. Doctor normalizes both sides of path compares (collapse `//`) because macOS `$TMPDIR` often ends with a slash.
 
 CI runs `control-embed smoke` on `ubuntu-latest` and `macos-latest`. Locally:
 

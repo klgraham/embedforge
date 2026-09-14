@@ -88,3 +88,38 @@ def test_smoke_is_documented_as_a_command(tmp_path: Path) -> None:
     result = _run_control(bindir, "--help")
     assert result.returncode == 0, result.stderr
     assert "smoke" in result.stdout
+
+
+def test_doctor_accepts_tmpdir_with_trailing_slash(tmp_path: Path) -> None:
+    tmpdir = tmp_path / "T"
+    tmpdir.mkdir()
+    env = os.environ.copy()
+    env["TMPDIR"] = f"{tmpdir}/"
+    env["CONTROL_EMBED_EVIDENCE"] = str(tmp_path / "evidence")
+    env["CONTROL_EMBED_STATE"] = str(tmp_path / "state.env")
+    env.pop("CONTROL_EMBED_SCRATCH", None)
+    launch = subprocess.run(
+        [str(CONTROL), "launch", "--run-id", "slash-tmp"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    doctor = subprocess.run(
+        [str(CONTROL), "doctor"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    cleanup = subprocess.run(
+        [str(CONTROL), "cleanup"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert launch.returncode == 0, launch.stdout + launch.stderr
+    assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert "doctor: OK" in doctor.stdout
+    assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
