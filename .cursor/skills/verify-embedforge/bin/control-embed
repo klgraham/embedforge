@@ -7,7 +7,9 @@ SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$SKILL_DIR/../../.." && pwd)"
 STATE_DIR="${CONTROL_EMBED_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/control-embed}"
 STATE_FILE="${CONTROL_EMBED_STATE:-$STATE_DIR/current.env}"
-DEFAULT_USER_CACHE="${HOME:-/home/ubuntu}/.cache/embedforge"
+LOGIN_HOME="$(getent passwd "$(id -un)" | cut -d: -f6)"
+LOGIN_HOME="${LOGIN_HOME:-/home/ubuntu}"
+DEFAULT_USER_CACHE="${CONTROL_EMBED_USER_CACHE:-$LOGIN_HOME/.cache/embedforge}"
 
 usage() {
   cat <<'EOF'
@@ -61,8 +63,8 @@ apply_isolation() {
 
 ensure_path() {
   if ! command -v uv >/dev/null 2>&1; then
-    if [[ -x "$HOME/.local/bin/uv" ]]; then
-      export PATH="$HOME/.local/bin:$PATH"
+    if [[ -x "$LOGIN_HOME/.local/bin/uv" ]]; then
+      export PATH="$LOGIN_HOME/.local/bin:$PATH"
     elif [[ -x /home/ubuntu/.local/bin/uv ]]; then
       export PATH="/home/ubuntu/.local/bin:$PATH"
     else
