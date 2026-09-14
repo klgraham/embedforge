@@ -50,6 +50,7 @@ def test_publish_defaults_private_and_records_provenance(tmp_path) -> None:
     assert dataset_uploads[0]["actual_private"] is True
     assert dataset_uploads[0]["config_name"] == "default"
     card = published.card
+    assert published.repo_id == "klogram/fiqa-openai-text-embedding-3-small-1536"
     assert "abc123def456" in card
     assert "mit" in card
     assert "https://huggingface.co/datasets/acme/fiqa" in card
@@ -59,7 +60,7 @@ def test_publish_defaults_private_and_records_provenance(tmp_path) -> None:
 
 def test_publish_rejects_existing_public_without_explicit_public(tmp_path) -> None:
     result, store, source = _job(tmp_path)
-    hub = FakeHub(repos={"klogram/fiqa-openai-text-embedding-3-small": {"private": False}})
+    hub = FakeHub(repos={"klogram/fiqa-openai-text-embedding-3-small-1536": {"private": False}})
     try:
         publish_job(result.job.id, store=store, hub=hub, source=source)
     except EmbedForgeError as exc:

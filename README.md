@@ -35,6 +35,13 @@ embed publish JOB_ID
 `plan` is a first-class paid-operation gate. It shows the source revision, output
 shape, destination, and estimated cost, and it never calls an embedding API.
 
+The default output repository name is
+`{dataset}-{provider}-{model}-{dimensions}`, for example
+`fiqa-openai-text-embedding-3-small-1536`. Provider-prefixed model names are
+normalized (`openai/text-embedding-3-small` becomes `text-embedding-3-small`).
+`run` records that destination on the local job; `publish` uses it unless you
+pass `--repo owner/name`.
+
 `run` writes a local job under `~/.cache/embedforge/jobs/<id>/` and does not
 publish. `publish` defaults to a **private** Hugging Face dataset.
 
