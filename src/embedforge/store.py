@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from embedforge.errors import EmbedForgeError
 from embedforge.paths import job_dir, jobs_dir
@@ -59,6 +59,7 @@ def read_json(path: Path) -> dict[str, Any]:
 class JobStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or jobs_dir()
+        self._writers: dict[str, IO[str]] = {}
 
     def directory(self, job_id: str) -> Path:
         return (self.root / job_id) if self.root != jobs_dir() else job_dir(job_id)
@@ -102,6 +103,31 @@ class JobStore:
     def embeddings_path(self, job_id: str) -> Path:
         return self.directory(job_id) / "embeddings.jsonl"
 
+    def open_journal(self, job_id: str) -> dict[tuple[str, int], EmbeddingRecord]:
+        """Repair the journal once and keep an append handle for later writes."""
+        existing = self._writers.get(job_id)
+        if existing is not None:
+            existing.flush()
+            return self.load_records(job_id)
+        path = self.embeddings_path(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        loaded: dict[tuple[str, int], EmbeddingRecord] = {}
+        if path.exists():
+            text = path.read_text(encoding="utf-8")
+            complete, loaded, torn = _parse_journal(job_id, text)
+            normalized = "".join(f"{line}\n" for line in complete)
+            if torn or text != normalized:
+                write_text_atomic(path, normalized)
+        else:
+            path.touch()
+        self._writers[job_id] = path.open("a", encoding="utf-8")
+        return loaded
+
+    def close_journal(self, job_id: str) -> None:
+        handle = self._writers.pop(job_id, None)
+        if handle is not None:
+            handle.close()
+
     def append_embedding(
         self,
         job_id: str,
@@ -119,45 +145,21 @@ class JobStore:
             "cache_key": key,
             "embedding": vector,
         }
-        path = self.embeddings_path(job_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _truncate_torn_journal(job_id, path)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
+        handle = self._writers.get(job_id)
+        if handle is None:
+            self.open_journal(job_id)
+            handle = self._writers[job_id]
+        handle.write(json.dumps(record) + "\n")
+        handle.flush()
 
     def load_records(self, job_id: str) -> dict[tuple[str, int], EmbeddingRecord]:
+        handle = self._writers.get(job_id)
+        if handle is not None:
+            handle.flush()
         path = self.embeddings_path(job_id)
         if not path.exists():
             return {}
-        loaded: dict[tuple[str, int], EmbeddingRecord] = {}
-        complete, _torn = _complete_journal_lines(job_id, path.read_text(encoding="utf-8"))
-        for line in complete:
-            raw = json.loads(line)
-            if not isinstance(raw, dict):
-                continue
-            index = raw.get("index")
-            if not isinstance(index, int) or isinstance(index, bool):
-                continue
-            split_raw = raw.get("split", "train")
-            split = split_raw if isinstance(split_raw, str) and split_raw else "train"
-            status = _record_status(raw)
-            embedding = raw.get("embedding")
-            vector: list[float] | None
-            if embedding is None:
-                vector = None
-            elif isinstance(embedding, list):
-                vector = [float(item) for item in embedding]
-            else:
-                continue
-            key_raw = raw.get("cache_key")
-            cache_key = key_raw if isinstance(key_raw, str) else None
-            loaded[(split, index)] = EmbeddingRecord(
-                split=split,
-                index=index,
-                status=status,
-                cache_key=cache_key,
-                embedding=vector,
-            )
+        _complete, loaded, _torn = _parse_journal(job_id, path.read_text(encoding="utf-8"))
         return loaded
 
     def load_embeddings(self, job_id: str) -> dict[int, list[float] | None]:
@@ -199,28 +201,55 @@ class JobStore:
         return updated
 
 
-def _complete_journal_lines(job_id: str, text: str) -> tuple[list[str], bool]:
+def _journal_loads(line: str) -> Any:
+    return json.loads(line)
+
+
+def _parse_journal(
+    job_id: str, text: str
+) -> tuple[list[str], dict[tuple[str, int], EmbeddingRecord], bool]:
     lines = [line for line in text.splitlines() if line.strip()]
     complete: list[str] = []
+    loaded: dict[tuple[str, int], EmbeddingRecord] = {}
     for offset, line in enumerate(lines):
         try:
-            json.loads(line)
+            raw = _journal_loads(line)
         except json.JSONDecodeError:
             if offset == len(lines) - 1:
-                return complete, True
+                return complete, loaded, True
             raise EmbedForgeError(f"corrupt embeddings journal in job {job_id}") from None
         complete.append(line)
-    return complete, False
+        record = _record_from_raw(raw)
+        if record is not None:
+            loaded[(record.split, record.index)] = record
+    return complete, loaded, False
 
 
-def _truncate_torn_journal(job_id: str, path: Path) -> None:
-    if not path.exists():
-        return
-    text = path.read_text(encoding="utf-8")
-    complete, torn = _complete_journal_lines(job_id, text)
-    normalized = "".join(f"{line}\n" for line in complete)
-    if torn or text != normalized:
-        write_text_atomic(path, normalized)
+def _record_from_raw(raw: object) -> EmbeddingRecord | None:
+    if not isinstance(raw, dict):
+        return None
+    index = raw.get("index")
+    if not isinstance(index, int) or isinstance(index, bool):
+        return None
+    split_raw = raw.get("split", "train")
+    split = split_raw if isinstance(split_raw, str) and split_raw else "train"
+    embedding = raw.get("embedding")
+    vector: list[float] | None
+    if embedding is None:
+        vector = None
+    elif isinstance(embedding, list):
+        vector = [float(item) for item in embedding]
+    else:
+        return None
+    key_raw = raw.get("cache_key")
+    cache_key = key_raw if isinstance(key_raw, str) else None
+    return EmbeddingRecord(
+        split=split,
+        index=index,
+        status=_record_status(raw),
+        cache_key=cache_key,
+        embedding=vector,
+    )
 
 
 def _record_status(raw: dict[str, Any]) -> RowStatus:

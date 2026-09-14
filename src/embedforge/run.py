@@ -183,7 +183,6 @@ def execute_job(
             f"output column {job.embedding.column!r} collides with a source column"
         )
     items = _work_items(loaded, job.embedding.source_columns[0])
-    records = store.load_records(job.id)
     started = time.monotonic()
     job = replace_job(job, status=JobStatus.RUNNING, error=None)
     store.save_job(job)
@@ -193,6 +192,7 @@ def execute_job(
     )
 
     try:
+        records = store.open_journal(job.id)
         pending = _pending_items(items, records, job, store, cache)
         session_embedded = 0
         tokens = job.progress.tokens
@@ -249,7 +249,6 @@ def execute_job(
                         vector,
                         indexed.rows_by_key[key],
                     )
-            records = store.load_records(job.id)
             progress = _progress_from_records(
                 items,
                 records,
@@ -262,7 +261,6 @@ def execute_job(
             if on_progress:
                 on_progress(_progress_line(progress, time.monotonic() - started))
 
-        records = store.load_records(job.id)
         progress = _progress_from_records(
             items,
             records,
@@ -289,6 +287,8 @@ def execute_job(
         if isinstance(exc, EmbedForgeError):
             raise
         raise EmbedForgeError(str(exc)) from exc
+    finally:
+        store.close_journal(job.id)
 
 
 def _work_items(loaded: LoadedDataset, column: str) -> list[WorkItem]:

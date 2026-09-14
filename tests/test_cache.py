@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import embedforge.store as store_mod
 from embedforge.cache import EmbeddingCache, cache_key
 from embedforge.errors import EmbedForgeError
 from embedforge.run import start_or_resume
@@ -120,3 +121,58 @@ def test_interior_journal_corruption_is_still_reported(tmp_path) -> None:
         assert "corrupt embeddings journal" in str(exc)
     else:
         raise AssertionError("expected append to refuse an interior-corrupt journal")
+
+
+def test_repeated_appends_parse_journal_once(tmp_path, monkeypatch) -> None:
+    parses = {"n": 0}
+    original = store_mod._journal_loads
+
+    def counted(line: str):
+        parses["n"] += 1
+        return original(line)
+
+    monkeypatch.setattr(store_mod, "_journal_loads", counted)
+
+    def append_n(count: int) -> int:
+        parses["n"] = 0
+        store = JobStore(tmp_path / f"jobs-{count}")
+        job_id = f"scale-{count}"
+        (store.root / job_id).mkdir(parents=True)
+        store.embeddings_path(job_id).write_text(
+            '{"split":"train","index":0,"status":"success","cache_key":"k","embedding":[1.0]}\n'
+        )
+        for index in range(1, count + 1):
+            store.append_embedding(
+                job_id, index, "k", [float(index)], status=RowStatus.SUCCESS, split="train"
+            )
+        store.close_journal(job_id)
+        return parses["n"]
+
+    small_n = 80
+    large_n = 160
+    small = append_n(small_n)
+    large = append_n(large_n)
+    assert small <= 2
+    assert large <= 2
+    assert large / small <= 2
+
+
+def test_run_does_not_reparse_journal_each_window(tmp_path, monkeypatch) -> None:
+    parses = {"n": 0}
+    original = store_mod._journal_loads
+
+    def counted(line: str):
+        parses["n"] += 1
+        return original(line)
+
+    monkeypatch.setattr(store_mod, "_journal_loads", counted)
+    start_or_resume(
+        "acme/fiqa",
+        column="text",
+        config=Config(batch_size=8, concurrency=1),
+        source=FakeDatasetSource(rows=[{"text": f"row-{index}"} for index in range(80)]),
+        store=JobStore(tmp_path / "jobs"),
+        cache=EmbeddingCache(tmp_path / "embeddings"),
+        embedder=FakeEmbedder(),
+    )
+    assert parses["n"] == 0
