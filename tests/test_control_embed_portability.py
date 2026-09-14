@@ -90,6 +90,16 @@ def test_smoke_is_documented_as_a_command(tmp_path: Path) -> None:
     assert "smoke" in result.stdout
 
 
+def test_canonical_paths_collapse_slashes(tmp_path: Path) -> None:
+    target = tmp_path / "T" / "embedforge-verify-slash-tmp" / "cache" / "embedforge"
+    target.mkdir(parents=True)
+    doubled = f"{tmp_path}/T//embedforge-verify-slash-tmp/cache/embedforge"
+    left = os.path.realpath(os.path.normpath(doubled))
+    right = os.path.realpath(os.path.normpath(str(target)))
+    assert left == right
+    assert "//" not in left
+
+
 def test_doctor_accepts_tmpdir_with_trailing_slash(tmp_path: Path) -> None:
     tmpdir = tmp_path / "T"
     tmpdir.mkdir()
