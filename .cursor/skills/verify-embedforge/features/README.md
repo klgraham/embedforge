@@ -4,7 +4,8 @@ This directory is the maintained source for verifying the user-facing behavior o
 
 ## Baseline preconditions
 
-- Launch with `.cursor/skills/verify-embedforge/bin/control-embed launch` so config, jobs, and cache live under `/tmp/embedforge-verify-$RUN_ID`.
+- Linux and macOS are supported. Run `control-embed smoke` on both; do not assume GNU userland or `getent`.
+- Launch with `.cursor/skills/verify-embedforge/bin/control-embed launch` so config, jobs, and cache live under `${TMPDIR:-/tmp}/embedforge-verify-$RUN_ID`.
 - Isolation uses `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and `HF_HOME` on that scratch tree. Leave `EMBEDFORGE_CONFIG_DIR` and `EMBEDFORGE_CACHE_DIR` unset.
 - Unset `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `HF_TOKEN`, and `HUGGING_FACE_HUB_TOKEN`.
 - Put `control-embed` on `PATH` or invoke it by repo-relative path.

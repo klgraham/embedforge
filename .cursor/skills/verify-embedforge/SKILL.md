@@ -11,6 +11,22 @@ Other surfaces (do not treat as the user path): the Python library used by `test
 
 Read `features/README.md` before driving. Drive the mapped feature you are proving; a single convenient entry point is incomplete when that feature file lists others.
 
+## Platforms
+
+Linux and macOS are supported. Verify launch → doctor → CLI → cleanup on both.
+
+`control-embed` is written for macOS's default Bash 3.2 and BSD userland as well as GNU/Linux. It must not call `getent` on Darwin (stock macOS does not ship it). Login-home lookup uses `dscl` on Darwin, `getent` only when that command exists on other systems, then `~user`. `--help` must succeed when `getent` is absent from `PATH`.
+
+Homebrew `uv` is accepted from `/opt/homebrew/bin/uv` or `/usr/local/bin/uv`. Scratch dirs use `${TMPDIR:-/tmp}` so they follow the platform temp location.
+
+CI runs `control-embed smoke` on `ubuntu-latest` and `macos-latest`. Locally:
+
+```bash
+.cursor/skills/verify-embedforge/bin/control-embed smoke
+```
+
+That is unpaid (`models`, `config --json` only): no embedding API calls and no Hub uploads.
+
 ## Launch
 
 Install deps once, then start every drive in a fresh isolated env. Ready means `uv run embed --help` prints `usage: embed` and lists `plan`.
@@ -59,7 +75,7 @@ Pass only when all of these hold:
 
 - `embedforge.__version__` is `0.1.0`
 - `uv run embed --help` lists `plan`
-- `embed config --json` has `cache_path` equal to `$XDG_CACHE_HOME/embedforge` (the scratch cache, not `/home/ubuntu/.cache/embedforge` and not the pre-launch `$HOME/.cache/embedforge`)
+- `embed config --json` has `cache_path` equal to `$XDG_CACHE_HOME/embedforge` (the scratch cache, not `$LOGIN_HOME/.cache/embedforge` and not the pre-launch login home cache)
 - `config_path` equals `$XDG_CONFIG_HOME/embedforge/config.toml`
 
 Doctor writes `artifacts/<run-id>/doctor.txt` and `doctor-config.json`. If doctor fails, stop; do not drive.
@@ -149,6 +165,7 @@ To inspect isolation vars before teardown:
 .cursor/skills/verify-embedforge/bin/control-embed cli -- <embed-args>
 .cursor/skills/verify-embedforge/bin/control-embed env
 .cursor/skills/verify-embedforge/bin/control-embed cleanup
+.cursor/skills/verify-embedforge/bin/control-embed smoke [--run-id ID]
 ```
 
 Optional env: `CONTROL_EMBED_RUN_ID`, `CONTROL_EMBED_SCRATCH`, `CONTROL_EMBED_EVIDENCE`, `CONTROL_EMBED_STATE`.
