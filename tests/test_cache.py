@@ -105,7 +105,7 @@ def test_interior_journal_corruption_is_still_reported(tmp_path) -> None:
     (store.root / job_id).mkdir(parents=True)
     path = store.embeddings_path(job_id)
     path.write_text(
-        'not-json\n'
+        "not-json\n"
         '{"split":"train","index":0,"status":"success","cache_key":"k","embedding":[1.0]}\n'
     )
     try:

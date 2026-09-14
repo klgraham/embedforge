@@ -158,7 +158,7 @@ class FakeHub:
         del token
         staged = load_from_disk(str(dataset_dir))
         if isinstance(staged, DatasetDict):
-            split_names = list(staged.keys())
+            split_names = [str(name) for name in staged.keys()]
         else:
             split_names = []
         if repo_id not in self.repos:
@@ -216,9 +216,7 @@ class FakeHub:
 
 def hub_generated_readme(config_name: str, splits: Sequence[str]) -> str:
     """Hub-style card with the pushed config plus an existing non-default mapping."""
-    pushed_files = "\n".join(
-        f"  - split: {name}\n    path: data/{name}-*" for name in splits
-    )
+    pushed_files = "\n".join(f"  - split: {name}\n    path: data/{name}-*" for name in splits)
     return (
         "---\n"
         "configs:\n"

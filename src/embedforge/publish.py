@@ -70,7 +70,7 @@ class HuggingFaceHub:
     def __init__(self, api: DestinationLookup | None = None) -> None:
         self._api = api
 
-    def _client(self, token: str | None) -> DestinationLookup:
+    def _client(self, token: str | None) -> Any:
         return self._api if self._api is not None else HfApi(token=token)
 
     def inspect_destination(self, repo_id: str, token: str | None) -> DestinationInfo:

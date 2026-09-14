@@ -428,7 +428,6 @@ def _persist_group(
         )
 
 
-
 def _progress_from_records(
     items: list[WorkItem],
     records: dict[tuple[str, int], EmbeddingRecord],
