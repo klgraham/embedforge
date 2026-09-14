@@ -100,6 +100,16 @@ def test_canonical_paths_collapse_slashes(tmp_path: Path) -> None:
     assert "//" not in left
 
 
+def _control(env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(CONTROL), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
 def test_doctor_accepts_tmpdir_with_trailing_slash(tmp_path: Path) -> None:
     tmpdir = tmp_path / "T"
     tmpdir.mkdir()
@@ -133,3 +143,62 @@ def test_doctor_accepts_tmpdir_with_trailing_slash(tmp_path: Path) -> None:
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
     assert "doctor: OK" in doctor.stdout
     assert cleanup.returncode == 0, cleanup.stdout + cleanup.stderr
+
+
+def test_transcript_reuses_shell_quoted_cmd(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env["CONTROL_EMBED_STATE_DIR"] = str(tmp_path / "state")
+    env["CONTROL_EMBED_RUN_ID"] = "quote-run"
+    env["CONTROL_EMBED_EVIDENCE"] = str(tmp_path / "ev")
+    env["CONTROL_EMBED_SCRATCH"] = str(tmp_path / "scratch")
+    env.pop("CONTROL_EMBED_STATE", None)
+    assert _control(env, "launch", "--run-id", "quote-run").returncode == 0
+    result = _control(env, "cli", "--", "set", "output_column", "my embedding")
+    assert result.returncode == 0, result.stdout + result.stderr
+    evidence = tmp_path / "ev"
+    cmd = next(evidence.glob("*.cmd.txt")).read_text()
+    transcript = next(evidence.glob("*.transcript.txt")).read_text()
+    first = transcript.splitlines()[0]
+    assert first == f"$ {cmd.rstrip(chr(10))}"
+    assert "output_column my embedding" not in first
+    _control(env, "cleanup")
+
+
+def test_two_runs_keep_config_evidence_and_cleanup_separate(tmp_path: Path) -> None:
+    base = os.environ.copy()
+    base["CONTROL_EMBED_STATE_DIR"] = str(tmp_path / "state")
+    base.pop("CONTROL_EMBED_STATE", None)
+    env_a = base.copy()
+    env_a["CONTROL_EMBED_RUN_ID"] = "run-a"
+    env_a["CONTROL_EMBED_EVIDENCE"] = str(tmp_path / "ev-a")
+    env_a["CONTROL_EMBED_SCRATCH"] = str(tmp_path / "scratch-a")
+    env_b = base.copy()
+    env_b["CONTROL_EMBED_RUN_ID"] = "run-b"
+    env_b["CONTROL_EMBED_EVIDENCE"] = str(tmp_path / "ev-b")
+    env_b["CONTROL_EMBED_SCRATCH"] = str(tmp_path / "scratch-b")
+
+    assert _control(env_a, "launch", "--run-id", "run-a").returncode == 0
+    set_a = _control(env_a, "cli", "--", "set", "output_column", "alpha-from-a")
+    assert set_a.returncode == 0, set_a.stdout + set_a.stderr
+    assert _control(env_b, "launch", "--run-id", "run-b").returncode == 0
+
+    get_a = _control(env_a, "cli", "--", "get", "output_column")
+    get_b = _control(env_b, "cli", "--", "get", "output_column")
+    assert get_a.returncode == 0, get_a.stdout + get_a.stderr
+    assert get_b.returncode == 0, get_b.stdout + get_b.stderr
+
+    a_out = "\n".join(path.read_text() for path in (tmp_path / "ev-a").glob("*.stdout.txt"))
+    b_out = "\n".join(path.read_text() for path in (tmp_path / "ev-b").glob("*.stdout.txt"))
+    assert "alpha-from-a" in a_out
+    assert "alpha-from-a" not in b_out
+    assert any(path.name.startswith("01-") for path in (tmp_path / "ev-b").glob("*.stdout.txt"))
+
+    assert (tmp_path / "scratch-a").is_dir()
+    assert (tmp_path / "scratch-b").is_dir()
+    assert _control(env_a, "cleanup").returncode == 0
+    assert not (tmp_path / "scratch-a").exists()
+    assert (tmp_path / "scratch-b").is_dir()
+    get_b_again = _control(env_b, "cli", "--", "get", "output_column")
+    assert get_b_again.returncode == 0, get_b_again.stdout + get_b_again.stderr
+    assert _control(env_b, "cleanup").returncode == 0
+    assert not (tmp_path / "scratch-b").exists()

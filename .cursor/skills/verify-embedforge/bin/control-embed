@@ -8,7 +8,8 @@ set -euo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$SKILL_DIR/../../.." && pwd)"
 STATE_DIR="${CONTROL_EMBED_STATE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/control-embed}"
-STATE_FILE="${CONTROL_EMBED_STATE:-$STATE_DIR/current.env}"
+REQUESTED_RUN_ID=""
+STATE_FILE=""
 
 login_home() {
   # Login-name home, not a remapped $HOME from a prior isolated run.
@@ -86,18 +87,83 @@ die() {
   exit 1
 }
 
+sanitize_run_id() {
+  local run_id="$1"
+  [[ -n "$run_id" ]] || die "run id is empty"
+  case "$run_id" in
+    *[!A-Za-z0-9._-]*) die "invalid run id $run_id; use letters, digits, . _ -" ;;
+  esac
+  printf '%s\n' "$run_id"
+}
+
+repo_key() {
+  local py
+  py="$(command -v python3 || true)"
+  if [[ -z "$py" && -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    py="$REPO_ROOT/.venv/bin/python"
+  fi
+  if [[ -n "$py" ]]; then
+    printf '%s' "$REPO_ROOT" | "$py" -c \
+      'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])'
+    return 0
+  fi
+  printf '%s' "$REPO_ROOT" | cksum | awk '{print $1}'
+}
+
+state_path() {
+  local run_id="$1"
+  if [[ -n "${CONTROL_EMBED_STATE:-}" ]]; then
+    printf '%s\n' "$CONTROL_EMBED_STATE"
+    return 0
+  fi
+  printf '%s\n' "$STATE_DIR/$(repo_key)-${run_id}.env"
+}
+
+resolve_run_id() {
+  if [[ -n "${REQUESTED_RUN_ID:-}" ]]; then
+    sanitize_run_id "$REQUESTED_RUN_ID"
+    return 0
+  fi
+  if [[ -n "${CONTROL_EMBED_RUN_ID:-}" ]]; then
+    sanitize_run_id "$CONTROL_EMBED_RUN_ID"
+    return 0
+  fi
+  if [[ -n "${RUN_ID:-}" ]]; then
+    sanitize_run_id "$RUN_ID"
+    return 0
+  fi
+  return 1
+}
+
 need_state() {
-  [[ -f "$STATE_FILE" ]] || die "no active instance; run: $0 launch"
+  local this_repo="$REPO_ROOT"
+  local rid=""
+  if rid="$(resolve_run_id)"; then
+    STATE_FILE="$(state_path "$rid")"
+  elif [[ -n "${CONTROL_EMBED_STATE:-}" ]]; then
+    STATE_FILE="$CONTROL_EMBED_STATE"
+  else
+    die "no run selected; pass --run-id or set CONTROL_EMBED_RUN_ID"
+  fi
+  [[ -f "$STATE_FILE" ]] || die "no instance for run ${rid:-?} at $STATE_FILE; run: $0 launch --run-id <id>"
   # shellcheck disable=SC1090
   source "$STATE_FILE"
   [[ -n "${RUN_ID:-}" && -n "${SCRATCH:-}" && -n "${EVIDENCE:-}" ]] || die "corrupt state file: $STATE_FILE"
+  if [[ -n "$rid" && "$RUN_ID" != "$rid" ]]; then
+    die "state $STATE_FILE is run_id=$RUN_ID, not $rid"
+  fi
+  if ! same_path "$REPO_ROOT" "$this_repo"; then
+    die "state $STATE_FILE belongs to $REPO_ROOT, not $this_repo"
+  fi
 }
 
 write_state() {
   mkdir -p "$(dirname "$STATE_FILE")"
+  REPO_KEY="$(repo_key)"
   cat >"$STATE_FILE" <<EOF
 RUN_ID=$(printf '%q' "$RUN_ID")
 REPO_ROOT=$(printf '%q' "$REPO_ROOT")
+REPO_KEY=$(printf '%q' "$REPO_KEY")
 SCRATCH=$(printf '%q' "$SCRATCH")
 EVIDENCE=$(printf '%q' "$EVIDENCE")
 ISOLATED_HOME=$(printf '%q' "$ISOLATED_HOME")
@@ -105,7 +171,29 @@ XDG_CONFIG_HOME=$(printf '%q' "$XDG_CONFIG_HOME")
 XDG_CACHE_HOME=$(printf '%q' "$XDG_CACHE_HOME")
 HF_HOME=$(printf '%q' "$HF_HOME")
 EMBEDFORGE_USER_CACHE=$(printf '%q' "$DEFAULT_USER_CACHE")
+STATE_FILE=$(printf '%q' "$STATE_FILE")
 EOF
+  cat >"$SCRATCH/.control-embed-own" <<EOF
+run_id=$RUN_ID
+repo_key=$REPO_KEY
+EOF
+}
+
+assert_scratch_owned() {
+  local marker="$SCRATCH/.control-embed-own"
+  local marked_id="" marked_key=""
+  [[ -n "${SCRATCH:-}" ]] || die "refusing cleanup: empty scratch"
+  case "$SCRATCH" in
+    / | /tmp | /var | /private | "$LOGIN_HOME" | "$HOME")
+      die "refusing cleanup of $SCRATCH"
+      ;;
+  esac
+  [[ -d "$SCRATCH" ]] || return 0
+  [[ -f "$marker" ]] || die "refusing cleanup: $SCRATCH has no ownership marker"
+  marked_id="$(awk -F= '/^run_id=/{print substr($0,8); exit}' "$marker")"
+  marked_key="$(awk -F= '/^repo_key=/{print substr($0,10); exit}' "$marker")"
+  [[ "$marked_id" == "$RUN_ID" ]] || die "refusing cleanup: marker run_id=$marked_id, this run is $RUN_ID"
+  [[ "$marked_key" == "$(repo_key)" ]] || die "refusing cleanup: marker is for another repository"
 }
 
 apply_isolation() {
@@ -166,7 +254,11 @@ cmd_launch() {
     esac
   done
   ensure_path
-  RUN_ID="${run_id:-${CONTROL_EMBED_RUN_ID:-$(date +%Y%m%dT%H%M%S)-$$}}"
+  if [[ -z "$run_id" && -n "${REQUESTED_RUN_ID:-}" ]]; then
+    run_id="$REQUESTED_RUN_ID"
+  fi
+  RUN_ID="$(sanitize_run_id "${run_id:-${CONTROL_EMBED_RUN_ID:-$(date +%Y%m%dT%H%M%S)-$$}}")"
+  STATE_FILE="$(state_path "$RUN_ID")"
   SCRATCH="${CONTROL_EMBED_SCRATCH:-${TMPDIR:-/tmp}/embedforge-verify-$RUN_ID}"
   EVIDENCE="${CONTROL_EMBED_EVIDENCE:-$SKILL_DIR/artifacts/$RUN_ID}"
   ISOLATED_HOME="$SCRATCH/home"
@@ -201,7 +293,7 @@ cmd_launch() {
   "platform": "$(uname -s 2>/dev/null || echo unknown)"
 }
 EOF
-  echo "control-embed ready run_id=$RUN_ID scratch=$SCRATCH evidence=$EVIDENCE"
+  echo "control-embed ready run_id=$RUN_ID scratch=$SCRATCH evidence=$EVIDENCE state=$STATE_FILE"
 }
 
 cmd_doctor() {
@@ -319,7 +411,8 @@ cmd_cli() {
   echo "$code" >"$exit_file"
 
   {
-    echo "\$ uv run embed $*"
+    printf '$ '
+    cat "$cmd_file"
     echo "--- stdout ---"
     cat "$stdout_file"
     echo "--- stderr ---"
@@ -351,12 +444,8 @@ cmd_env() {
 }
 
 cmd_cleanup() {
-  if [[ ! -f "$STATE_FILE" ]]; then
-    echo "control-embed cleanup: nothing to tear down"
-    return 0
-  fi
-  # shellcheck disable=SC1090
-  source "$STATE_FILE"
+  need_state
+  assert_scratch_owned
   local session
   if command -v tmux >/dev/null 2>&1; then
     while read -r session; do
@@ -424,6 +513,19 @@ cmd_smoke() {
 }
 
 main() {
+  REQUESTED_RUN_ID=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run-id)
+        [[ $# -ge 2 ]] || die "--run-id needs a value"
+        REQUESTED_RUN_ID="$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
   local cmd="${1:-}"
   shift || true
   case "$cmd" in

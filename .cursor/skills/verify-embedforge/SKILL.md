@@ -59,7 +59,7 @@ Resolved app paths:
 - Jobs: `$XDG_CACHE_HOME/embedforge/jobs/<id>/`
 - Embedding cache: `$XDG_CACHE_HOME/embedforge/embeddings/`
 
-Two verification instances must use different `RUN_ID`s. Never drive a user's real `~/.cache/embedforge` or `~/.config/embedforge`.
+Two verification instances must use different `RUN_ID`s. Each run has its own state file `$CONTROL_EMBED_STATE_DIR/<repo-key>-<run-id>.env`. After `launch`, every later command must select that run with `--run-id` or `CONTROL_EMBED_RUN_ID` (same-process `smoke` keeps the id in memory). Cleanup refuses a scratch directory whose ownership marker does not match this repo and run. Never drive a user's real `~/.cache/embedforge` or `~/.config/embedforge`.
 
 `uv` must be on `PATH` (`https://astral.sh/uv`). If it is missing, install it before launch; that is environment setup, not app behavior.
 
@@ -130,7 +130,7 @@ Each `cli` drive writes:
 
 - `<seq>-<slug>.cmd.txt` — exact command
 - `<seq>-<slug>.stdout.txt` / `.stderr.txt` / `.exit.txt`
-- `<seq>-<slug>.transcript.txt` — command, stdout, stderr, exit together
+- `<seq>-<slug>.transcript.txt` — the `$` line is the shell-quoted `.cmd.txt` contents, then stdout, stderr, exit
 - `<seq>-<slug>.side-effects.txt` — `jobs/` listing, `embed cache info`, `embed status`
 
 Proof standards:
@@ -147,7 +147,7 @@ Proof standards:
 .cursor/skills/verify-embedforge/bin/control-embed cleanup
 ```
 
-Kills only `ef-verify-$RUN_ID-*` tmux sessions this harness would have created, then `rm -rf` the scratch tree from the state file. It never kills by process name (`embed`, `uv`). It never deletes `$EVIDENCE`. After cleanup, the evidence directory must still exist and still contain the transcripts from the run.
+Selects this run's state, checks the scratch ownership marker (`run_id` + `repo_key`), kills only `ef-verify-$RUN_ID-*` tmux sessions this harness would have created, then `rm -rf` that scratch. It never kills by process name (`embed`, `uv`). It never deletes `$EVIDENCE`. After cleanup, the evidence directory must still exist and still contain the transcripts from the run.
 
 To inspect isolation vars before teardown:
 
@@ -160,15 +160,15 @@ To inspect isolation vars before teardown:
 `bin/control-embed` is executable. Commands:
 
 ```bash
-.cursor/skills/verify-embedforge/bin/control-embed launch [--run-id ID]
-.cursor/skills/verify-embedforge/bin/control-embed doctor
-.cursor/skills/verify-embedforge/bin/control-embed cli -- <embed-args>
-.cursor/skills/verify-embedforge/bin/control-embed env
-.cursor/skills/verify-embedforge/bin/control-embed cleanup
-.cursor/skills/verify-embedforge/bin/control-embed smoke [--run-id ID]
+.cursor/skills/verify-embedforge/bin/control-embed [--run-id ID] launch
+.cursor/skills/verify-embedforge/bin/control-embed [--run-id ID] doctor
+.cursor/skills/verify-embedforge/bin/control-embed [--run-id ID] cli -- <embed-args>
+.cursor/skills/verify-embedforge/bin/control-embed [--run-id ID] env
+.cursor/skills/verify-embedforge/bin/control-embed [--run-id ID] cleanup
+.cursor/skills/verify-embedforge/bin/control-embed [--run-id ID] smoke
 ```
 
-Optional env: `CONTROL_EMBED_RUN_ID`, `CONTROL_EMBED_SCRATCH`, `CONTROL_EMBED_EVIDENCE`, `CONTROL_EMBED_STATE`.
+Optional env: `CONTROL_EMBED_RUN_ID`, `CONTROL_EMBED_SCRATCH`, `CONTROL_EMBED_EVIDENCE`, `CONTROL_EMBED_STATE`, `CONTROL_EMBED_STATE_DIR`.
 
 ## Guardrails
 

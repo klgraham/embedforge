@@ -27,4 +27,4 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --group dev
       - run: uv run pytest tests/test_control_embed_portability.py
-      - run: .cursor/skills/verify-embedforge/bin/control-embed smoke --run-id ci-smoke
+      - run: CONTROL_EMBED_RUN_ID=ci-smoke .cursor/skills/verify-embedforge/bin/control-embed smoke --run-id ci-smoke
