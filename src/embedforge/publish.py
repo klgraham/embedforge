@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from datasets import DatasetDict, load_from_disk
-from huggingface_hub import HfApi, whoami
+from huggingface_hub import DatasetCard, DatasetCardData, HfApi, hf_hub_download, whoami
 
 from embedforge import __version__
 from embedforge.errors import EmbedForgeError
@@ -38,6 +38,15 @@ class HubClient(Protocol):
         token: str | None,
     ) -> None: ...
 
+    def read_text(
+        self,
+        path_in_repo: str,
+        repo_id: str,
+        *,
+        revision: str | None,
+        token: str | None,
+    ) -> str: ...
+
     def upload_text(
         self,
         content: str,
@@ -49,16 +58,33 @@ class HubClient(Protocol):
     ) -> None: ...
 
 
+class DestinationLookup(Protocol):
+    def repo_exists(
+        self, repo_id: str, *, repo_type: str | None = None, token: str | None = None
+    ) -> bool: ...
+
+    def dataset_info(self, repo_id: str, token: str | None = None) -> Any: ...
+
+
 class HuggingFaceHub:
+    def __init__(self, api: DestinationLookup | None = None) -> None:
+        self._api = api
+
+    def _client(self, token: str | None) -> DestinationLookup:
+        return self._api if self._api is not None else HfApi(token=token)
+
     def inspect_destination(self, repo_id: str, token: str | None) -> DestinationInfo:
-        api = HfApi(token=token)
+        api = self._client(token)
         try:
-            exists = api.repo_exists(repo_id, repo_type="dataset")
-        except Exception:
-            exists = False
+            exists = api.repo_exists(repo_id, repo_type="dataset", token=token)
+        except Exception as exc:
+            raise EmbedForgeError(f"could not inspect destination {repo_id}: {exc}") from exc
         if not exists:
             return DestinationInfo(exists=False, private=None)
-        info = api.dataset_info(repo_id)
+        try:
+            info = api.dataset_info(repo_id, token=token)
+        except Exception as exc:
+            raise EmbedForgeError(f"could not inspect destination {repo_id}: {exc}") from exc
         return DestinationInfo(exists=True, private=bool(getattr(info, "private", False)))
 
     def push_dataset(
@@ -122,6 +148,43 @@ class HuggingFaceHub:
                 revision=revision,
             )
 
+    def read_text(
+        self,
+        path_in_repo: str,
+        repo_id: str,
+        *,
+        revision: str | None,
+        token: str | None,
+    ) -> str:
+        if not token:
+            raise EmbedForgeError(
+                "API credentials must be supplied through environment variables.\n"
+                "Set HF_TOKEN in your shell environment."
+            )
+        try:
+            downloaded = hf_hub_download(
+                repo_id,
+                path_in_repo,
+                repo_type="dataset",
+                revision=revision,
+                token=token,
+            )
+        except Exception as exc:
+            raise EmbedForgeError(f"could not read {path_in_repo} from {repo_id}: {exc}") from exc
+        return Path(downloaded).read_text(encoding="utf-8")
+
+
+def merge_dataset_card(generated: str, ours: str) -> str:
+    """Keep Hub configs/dataset_info and overlay EmbedForge license plus body."""
+    generated_card = DatasetCard(generated, ignore_metadata_errors=True)
+    our_card = DatasetCard(ours, ignore_metadata_errors=True)
+    merged = generated_card.data.to_dict()
+    license_value = our_card.data.to_dict().get("license")
+    if license_value is not None:
+        merged["license"] = license_value
+    body = our_card.text.lstrip("\n")
+    return f"---\n{DatasetCardData(**merged).to_yaml()}\n---\n{body}"
+
 
 @dataclass
 class HuggingFacePublisher:
@@ -153,8 +216,15 @@ class HuggingFacePublisher:
             config_name=config_name,
             token=token,
         )
+        generated = self.hub.read_text(
+            "README.md",
+            repo_id,
+            revision=revision,
+            token=token,
+        )
+        merged_card = merge_dataset_card(generated, card)
         self.hub.upload_text(
-            card,
+            merged_card,
             "README.md",
             repo_id,
             revision=revision,

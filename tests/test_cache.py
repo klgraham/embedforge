@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from embedforge.cache import EmbeddingCache, cache_key
+from embedforge.errors import EmbedForgeError
 from embedforge.run import start_or_resume
 from embedforge.shapes import Config, RowStatus
 from embedforge.store import JobStore
@@ -75,3 +76,47 @@ def test_journal_recovers_incomplete_trailing_record(tmp_path) -> None:
     assert set(records) == {("train", 0)}
     assert records[("train", 0)].status is RowStatus.SUCCESS
     assert records[("train", 0)].embedding == [1.0]
+
+
+def test_append_truncates_torn_journal_before_write(tmp_path) -> None:
+    store = JobStore(tmp_path / "jobs")
+    job_id = "01TESTJOURNALAPPEND00000000"
+    (store.root / job_id).mkdir(parents=True)
+    path = store.embeddings_path(job_id)
+    path.write_text(
+        '{"split":"train","index":0,"status":"success","cache_key":"k","embedding":[1.0]}\n'
+        '{"index":'
+    )
+    store.load_records(job_id)
+    store.append_embedding(job_id, 1, "k", [2.0], status=RowStatus.SUCCESS, split="train")
+    records = store.load_records(job_id)
+    assert set(records) == {("train", 0), ("train", 1)}
+    assert records[("train", 1)].embedding == [2.0]
+    store.append_embedding(job_id, 2, "k", [3.0], status=RowStatus.SUCCESS, split="train")
+    records = store.load_records(job_id)
+    assert set(records) == {("train", 0), ("train", 1), ("train", 2)}
+    text = path.read_text()
+    assert '{"index":{' not in text
+
+
+def test_interior_journal_corruption_is_still_reported(tmp_path) -> None:
+    store = JobStore(tmp_path / "jobs")
+    job_id = "01TESTJOURNALCORRUPT0000000"
+    (store.root / job_id).mkdir(parents=True)
+    path = store.embeddings_path(job_id)
+    path.write_text(
+        'not-json\n'
+        '{"split":"train","index":0,"status":"success","cache_key":"k","embedding":[1.0]}\n'
+    )
+    try:
+        store.load_records(job_id)
+    except EmbedForgeError as exc:
+        assert "corrupt embeddings journal" in str(exc)
+    else:
+        raise AssertionError("expected interior journal corruption to be reported")
+    try:
+        store.append_embedding(job_id, 1, "k", [2.0], status=RowStatus.SUCCESS, split="train")
+    except EmbedForgeError as exc:
+        assert "corrupt embeddings journal" in str(exc)
+    else:
+        raise AssertionError("expected append to refuse an interior-corrupt journal")

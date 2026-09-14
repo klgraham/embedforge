@@ -197,8 +197,8 @@ def execute_job(
         session_embedded = 0
         tokens = job.progress.tokens
         cost = job.progress.cost_usd
-        unique = _dedupe_pending(pending, job)
-        windows = _chunk(unique, job.embedding.batch_size)
+        indexed = _index_pending(pending, job)
+        windows = _chunk(indexed.unique, job.embedding.batch_size)
         for window in _group_windows(windows, job.embedding.concurrency):
             texts_by_chunk = [[text for _key, text in chunk] for chunk in window]
             batch_results = _embed_chunks(texts_by_chunk, job, embedder, request_dims)
@@ -214,8 +214,7 @@ def execute_job(
                             )
                         except Exception:
                             _persist_group(
-                                pending,
-                                key,
+                                indexed.rows_by_key[key],
                                 job,
                                 store,
                                 records,
@@ -227,14 +226,28 @@ def execute_job(
                         tokens += single.tokens
                         cost += estimate_cost_usd(single.tokens, model_info.usd_per_million_tokens)
                         session_embedded += _store_unique_success(
-                            job, cache, store, records, key, text, single.vectors[0], pending
+                            job,
+                            cache,
+                            store,
+                            records,
+                            key,
+                            text,
+                            single.vectors[0],
+                            indexed.rows_by_key[key],
                         )
                     continue
                 tokens += batch.tokens
                 cost += estimate_cost_usd(batch.tokens, model_info.usd_per_million_tokens)
                 for (key, text), vector in zip(chunk, batch.vectors, strict=True):
                     session_embedded += _store_unique_success(
-                        job, cache, store, records, key, text, vector, pending
+                        job,
+                        cache,
+                        store,
+                        records,
+                        key,
+                        text,
+                        vector,
+                        indexed.rows_by_key[key],
                     )
             records = store.load_records(job.id)
             progress = _progress_from_records(
@@ -344,21 +357,25 @@ def _pending_items(
     return pending
 
 
-def _dedupe_pending(pending: list[WorkItem], job: Job) -> list[tuple[str, str]]:
-    """Return unique (cache_key, text) pairs in first-seen order."""
-    seen: dict[str, str] = {}
-    ordered: list[tuple[str, str]] = []
-    for _split, _index, text in pending:
-        key = _key(job, text)
-        if key in seen:
-            continue
-        seen[key] = text
-        ordered.append((key, text))
-    return ordered
+@dataclass(frozen=True)
+class PendingIndex:
+    unique: list[tuple[str, str]]
+    rows_by_key: dict[str, list[WorkItem]]
 
 
-def _rows_for_key(pending: list[WorkItem], job: Job, key: str) -> list[WorkItem]:
-    return [item for item in pending if _key(job, item[2]) == key]
+def _index_pending(pending: list[WorkItem], job: Job) -> PendingIndex:
+    """Hash each pending row once and group duplicates by cache key."""
+    rows_by_key: dict[str, list[WorkItem]] = {}
+    unique: list[tuple[str, str]] = []
+    for item in pending:
+        key = _key(job, item[2])
+        group = rows_by_key.get(key)
+        if group is None:
+            rows_by_key[key] = [item]
+            unique.append((key, item[2]))
+        else:
+            group.append(item)
+    return PendingIndex(unique=unique, rows_by_key=rows_by_key)
 
 
 def _store_unique_success(
@@ -369,7 +386,7 @@ def _store_unique_success(
     key: str,
     text: str,
     vector: list[float],
-    pending: list[WorkItem],
+    rows: list[WorkItem],
 ) -> int:
     cache.put(
         job.embedding.provider,
@@ -378,8 +395,7 @@ def _store_unique_success(
         text,
         vector,
     )
-    written = 0
-    for split, index, _text in _rows_for_key(pending, job, key):
+    for split, index, _text in rows:
         store.append_embedding(job.id, index, key, vector, status=RowStatus.SUCCESS, split=split)
         records[(split, index)] = EmbeddingRecord(
             split=split,
@@ -388,13 +404,11 @@ def _store_unique_success(
             cache_key=key,
             embedding=vector,
         )
-        written += 1
-    return written
+    return len(rows)
 
 
 def _persist_group(
-    pending: list[WorkItem],
-    key: str,
+    rows: list[WorkItem],
     job: Job,
     store: JobStore,
     records: dict[tuple[str, int], EmbeddingRecord],
@@ -403,9 +417,7 @@ def _persist_group(
     vector: list[float] | None,
     cache_key_value: str | None,
 ) -> None:
-    for split, index, text in pending:
-        if _key(job, text) != key:
-            continue
+    for split, index, _text in rows:
         store.append_embedding(job.id, index, cache_key_value, vector, status=status, split=split)
         records[(split, index)] = EmbeddingRecord(
             split=split,
@@ -414,6 +426,7 @@ def _persist_group(
             cache_key=cache_key_value,
             embedding=vector,
         )
+
 
 
 def _progress_from_records(

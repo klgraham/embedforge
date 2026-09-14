@@ -121,6 +121,7 @@ class JobStore:
         }
         path = self.embeddings_path(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
+        _truncate_torn_journal(job_id, path)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
 
@@ -129,14 +130,9 @@ class JobStore:
         if not path.exists():
             return {}
         loaded: dict[tuple[str, int], EmbeddingRecord] = {}
-        lines = [line for line in path.read_text().splitlines() if line.strip()]
-        for offset, line in enumerate(lines):
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError:
-                if offset == len(lines) - 1:
-                    break
-                raise EmbedForgeError(f"corrupt embeddings journal in job {job_id}") from None
+        complete, _torn = _complete_journal_lines(job_id, path.read_text(encoding="utf-8"))
+        for line in complete:
+            raw = json.loads(line)
             if not isinstance(raw, dict):
                 continue
             index = raw.get("index")
@@ -201,6 +197,30 @@ class JobStore:
         )
         self.save_job(updated)
         return updated
+
+
+def _complete_journal_lines(job_id: str, text: str) -> tuple[list[str], bool]:
+    lines = [line for line in text.splitlines() if line.strip()]
+    complete: list[str] = []
+    for offset, line in enumerate(lines):
+        try:
+            json.loads(line)
+        except json.JSONDecodeError:
+            if offset == len(lines) - 1:
+                return complete, True
+            raise EmbedForgeError(f"corrupt embeddings journal in job {job_id}") from None
+        complete.append(line)
+    return complete, False
+
+
+def _truncate_torn_journal(job_id: str, path: Path) -> None:
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8")
+    complete, torn = _complete_journal_lines(job_id, text)
+    normalized = "".join(f"{line}\n" for line in complete)
+    if torn or text != normalized:
+        write_text_atomic(path, normalized)
 
 
 def _record_status(raw: dict[str, Any]) -> RowStatus:

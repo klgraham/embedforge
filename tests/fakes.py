@@ -136,6 +136,7 @@ class FakeHub:
 
     repos: dict[str, dict[str, object]] = field(default_factory=dict)
     uploads: list[dict[str, object]] = field(default_factory=list)
+    files: dict[tuple[str, str, str | None], str] = field(default_factory=dict)
 
     def inspect_destination(self, repo_id: str, token: str | None) -> DestinationInfo:
         del token
@@ -162,6 +163,10 @@ class FakeHub:
             split_names = []
         if repo_id not in self.repos:
             self.repos[repo_id] = {"private": private}
+        self.files[(repo_id, "README.md", revision)] = hub_generated_readme(
+            config_name or "default",
+            split_names or ["train"],
+        )
         self.uploads.append(
             {
                 "kind": "dataset",
@@ -174,6 +179,20 @@ class FakeHub:
             }
         )
 
+    def read_text(
+        self,
+        path_in_repo: str,
+        repo_id: str,
+        *,
+        revision: str | None,
+        token: str | None,
+    ) -> str:
+        del token
+        key = (repo_id, path_in_repo, revision)
+        if key not in self.files:
+            raise FileNotFoundError(f"{path_in_repo} missing from {repo_id}")
+        return self.files[key]
+
     def upload_text(
         self,
         content: str,
@@ -184,6 +203,7 @@ class FakeHub:
         token: str | None,
     ) -> None:
         del token
+        self.files[(repo_id, path_in_repo, revision)] = content
         self.uploads.append(
             {
                 "kind": path_in_repo,
@@ -192,6 +212,35 @@ class FakeHub:
                 "content": content,
             }
         )
+
+
+def hub_generated_readme(config_name: str, splits: Sequence[str]) -> str:
+    """Hub-style card with the pushed config plus an existing non-default mapping."""
+    pushed_files = "\n".join(
+        f"  - split: {name}\n    path: data/{name}-*" for name in splits
+    )
+    return (
+        "---\n"
+        "configs:\n"
+        f"- config_name: {config_name}\n"
+        "  data_files:\n"
+        f"{pushed_files}\n"
+        "- config_name: corpus\n"
+        "  data_files:\n"
+        "  - split: train\n"
+        "    path: corpus/train-*\n"
+        "dataset_info:\n"
+        f"- config_name: {config_name}\n"
+        "  splits:\n"
+        f"  - name: {splits[0]}\n"
+        "    num_examples: 1\n"
+        "- config_name: corpus\n"
+        "  splits:\n"
+        "  - name: train\n"
+        "    num_examples: 10\n"
+        "---\n\n"
+        "# Auto-generated dataset card\n"
+    )
 
 
 def _vector(text: str, dimensions: int) -> list[float]:
