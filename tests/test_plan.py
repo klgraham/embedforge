@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import embedforge.plan as plan_mod
+import embedforge.providers as providers_mod
+from embedforge.plan import build_plan, default_output_repo
+from embedforge.shapes import Config
+from tests.fakes import FakeDatasetSource, FakeEmbedder
+
+
+def test_plan_does_not_call_embedding_provider(monkeypatch) -> None:
+    source = FakeDatasetSource(
+        rows=[{"text": "query about apples"}, {"text": "query about oranges"}]
+    )
+    embedder = FakeEmbedder()
+
+    def explode(provider: str) -> FakeEmbedder:
+        raise AssertionError(f"plan must not construct embedder for {provider}")
+
+    monkeypatch.setattr(providers_mod, "get_embedder", explode)
+    monkeypatch.setattr(plan_mod, "load_config", lambda: Config(hf_namespace="klogram"))
+    plan = build_plan(
+        "acme/fiqa",
+        column="text",
+        config=Config(provider="openai", model="text-embedding-3-small", hf_namespace="klogram"),
+        source=source,
+    )
+    assert embedder.calls == []
+    assert plan.source.revision == "abc123def456"
+    assert plan.embedding.provider == "openai"
+    assert plan.embedding.model == "text-embedding-3-small"
+    assert plan.embedding.dimensions == 1536
+    assert plan.output.repo == "klogram/fiqa-openai-text-embedding-3-small"
+    assert plan.output.column == "embedding"
+    assert plan.estimates.rows == 2
+    assert plan.estimates.tokens > 0
+    assert plan.estimates.cost_usd > 0
+
+
+def test_plan_limit_reduces_estimates() -> None:
+    source = FakeDatasetSource(rows=[{"text": "x" * 40} for _ in range(10)])
+    full = build_plan("acme/fiqa", column="text", source=source)
+    limited = build_plan("acme/fiqa", column="text", limit=2, source=source)
+    assert limited.estimates.rows == 2
+    assert limited.estimates.characters < full.estimates.characters
+    assert limited.estimates.cost_usd < full.estimates.cost_usd
+
+
+def test_default_output_repo_normalizes_provider_independent_model() -> None:
+    assert (
+        default_output_repo(
+            "BeIR/fiqa",
+            "openai",
+            "openai/text-embedding-3-small",
+            namespace=None,
+        )
+        == "fiqa-openai-text-embedding-3-small"
+    )
