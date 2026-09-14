@@ -1,0 +1,546 @@
+#!/usr/bin/env bash
+# Isolated harness for the EmbedForge `embed` CLI.
+# Invocation is documented in ../SKILL.md — do not reverse-engineer this file.
+# Written for Linux and macOS default Bash 3.2 + BSD/GNU userland. Do not call
+# getent on Darwin; stock macOS does not ship it.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$SKILL_DIR/../../.." && pwd)"
+STATE_DIR="${CONTROL_EMBED_STATE_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/control-embed}"
+REQUESTED_RUN_ID=""
+STATE_FILE=""
+
+login_home() {
+  # Login-name home, not a remapped $HOME from a prior isolated run.
+  local user="" home=""
+  user="$(id -un 2>/dev/null || true)"
+  case "$user" in
+    *[!A-Za-z0-9._-]*) user="" ;;
+  esac
+
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin)
+      if [[ -n "$user" ]] && command -v dscl >/dev/null 2>&1; then
+        home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}' || true)"
+      fi
+      ;;
+    *)
+      if [[ -n "$user" ]] && command -v getent >/dev/null 2>&1; then
+        home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+      fi
+      ;;
+  esac
+
+  if [[ -z "$home" && -n "$user" ]]; then
+    home="$(eval "printf '%s\\n' ~${user}" 2>/dev/null || true)"
+    if [[ "$home" == "~$user" ]]; then
+      home=""
+    fi
+  fi
+  if [[ -z "$home" ]]; then
+    home="${HOME:-}"
+  fi
+  printf '%s\n' "${home:-${TMPDIR:-/tmp}}"
+}
+
+LOGIN_HOME="$(login_home)"
+DEFAULT_USER_CACHE="${CONTROL_EMBED_USER_CACHE:-$LOGIN_HOME/.cache/embedforge}"
+
+_python() {
+  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    printf '%s\n' "$REPO_ROOT/.venv/bin/python"
+    return 0
+  fi
+  command -v python3 || command -v python || return 1
+}
+
+normalize_path() {
+  # Real canonical form: collapse // and resolve macOS /var -> /private/var.
+  # Do not use bash ${var//\/\//\/}; it does not canonicalize on Bash 3.2.
+  local path="$1"
+  local py
+  py="$(_python)" || die "python is required to compare isolation paths"
+  "$py" -c 'import os, sys; print(os.path.realpath(os.path.normpath(sys.argv[1])))' "$path"
+}
+
+same_path() {
+  [[ "$(normalize_path "$1")" == "$(normalize_path "$2")" ]]
+}
+
+usage() {
+  cat <<'EOF'
+usage: control-embed <command> [args]
+
+commands:
+  launch [--run-id ID]   sync the CLI and open an isolated scratch home/XDG
+  doctor                 read-only check that this instance is worth driving
+  cli -- <embed-args>    run `uv run embed ...` inside the scratch env
+  env                    print the isolation variables
+  cleanup                tear down scratch and sessions; keep evidence
+  smoke [--run-id ID]    unpaid launch → doctor → models/config → cleanup
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+sanitize_run_id() {
+  local run_id="$1"
+  [[ -n "$run_id" ]] || die "run id is empty"
+  case "$run_id" in
+    *[!A-Za-z0-9._-]*) die "invalid run id $run_id; use letters, digits, . _ -" ;;
+  esac
+  printf '%s\n' "$run_id"
+}
+
+repo_key() {
+  local py
+  py="$(command -v python3 || true)"
+  if [[ -z "$py" && -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    py="$REPO_ROOT/.venv/bin/python"
+  fi
+  if [[ -n "$py" ]]; then
+    printf '%s' "$REPO_ROOT" | "$py" -c \
+      'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])'
+    return 0
+  fi
+  printf '%s' "$REPO_ROOT" | cksum | awk '{print $1}'
+}
+
+state_path() {
+  local run_id="$1"
+  if [[ -n "${CONTROL_EMBED_STATE:-}" ]]; then
+    printf '%s\n' "$CONTROL_EMBED_STATE"
+    return 0
+  fi
+  printf '%s\n' "$STATE_DIR/$(repo_key)-${run_id}.env"
+}
+
+resolve_run_id() {
+  if [[ -n "${REQUESTED_RUN_ID:-}" ]]; then
+    sanitize_run_id "$REQUESTED_RUN_ID"
+    return 0
+  fi
+  if [[ -n "${CONTROL_EMBED_RUN_ID:-}" ]]; then
+    sanitize_run_id "$CONTROL_EMBED_RUN_ID"
+    return 0
+  fi
+  if [[ -n "${RUN_ID:-}" ]]; then
+    sanitize_run_id "$RUN_ID"
+    return 0
+  fi
+  return 1
+}
+
+need_state() {
+  local this_repo="$REPO_ROOT"
+  local rid=""
+  if rid="$(resolve_run_id)"; then
+    STATE_FILE="$(state_path "$rid")"
+  elif [[ -n "${CONTROL_EMBED_STATE:-}" ]]; then
+    STATE_FILE="$CONTROL_EMBED_STATE"
+  else
+    die "no run selected; pass --run-id or set CONTROL_EMBED_RUN_ID"
+  fi
+  [[ -f "$STATE_FILE" ]] || die "no instance for run ${rid:-?} at $STATE_FILE; run: $0 launch --run-id <id>"
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  [[ -n "${RUN_ID:-}" && -n "${SCRATCH:-}" && -n "${EVIDENCE:-}" ]] || die "corrupt state file: $STATE_FILE"
+  if [[ -n "$rid" && "$RUN_ID" != "$rid" ]]; then
+    die "state $STATE_FILE is run_id=$RUN_ID, not $rid"
+  fi
+  if ! same_path "$REPO_ROOT" "$this_repo"; then
+    die "state $STATE_FILE belongs to $REPO_ROOT, not $this_repo"
+  fi
+}
+
+write_state() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  REPO_KEY="$(repo_key)"
+  cat >"$STATE_FILE" <<EOF
+RUN_ID=$(printf '%q' "$RUN_ID")
+REPO_ROOT=$(printf '%q' "$REPO_ROOT")
+REPO_KEY=$(printf '%q' "$REPO_KEY")
+SCRATCH=$(printf '%q' "$SCRATCH")
+EVIDENCE=$(printf '%q' "$EVIDENCE")
+ISOLATED_HOME=$(printf '%q' "$ISOLATED_HOME")
+XDG_CONFIG_HOME=$(printf '%q' "$XDG_CONFIG_HOME")
+XDG_CACHE_HOME=$(printf '%q' "$XDG_CACHE_HOME")
+HF_HOME=$(printf '%q' "$HF_HOME")
+EMBEDFORGE_USER_CACHE=$(printf '%q' "$DEFAULT_USER_CACHE")
+STATE_FILE=$(printf '%q' "$STATE_FILE")
+EOF
+  cat >"$SCRATCH/.control-embed-own" <<EOF
+run_id=$RUN_ID
+repo_key=$REPO_KEY
+EOF
+}
+
+assert_scratch_owned() {
+  local marker="$SCRATCH/.control-embed-own"
+  local marked_id="" marked_key=""
+  [[ -n "${SCRATCH:-}" ]] || die "refusing cleanup: empty scratch"
+  case "$SCRATCH" in
+    / | /tmp | /var | /private | "$LOGIN_HOME" | "$HOME")
+      die "refusing cleanup of $SCRATCH"
+      ;;
+  esac
+  [[ -d "$SCRATCH" ]] || return 0
+  [[ -f "$marker" ]] || die "refusing cleanup: $SCRATCH has no ownership marker"
+  marked_id="$(awk -F= '/^run_id=/{print substr($0,8); exit}' "$marker")"
+  marked_key="$(awk -F= '/^repo_key=/{print substr($0,10); exit}' "$marker")"
+  [[ "$marked_id" == "$RUN_ID" ]] || die "refusing cleanup: marker run_id=$marked_id, this run is $RUN_ID"
+  [[ "$marked_key" == "$(repo_key)" ]] || die "refusing cleanup: marker is for another repository"
+}
+
+apply_isolation() {
+  export HOME="$ISOLATED_HOME"
+  export XDG_CONFIG_HOME
+  export XDG_CACHE_HOME
+  export HF_HOME
+  export HF_HUB_DISABLE_TELEMETRY=1
+  unset EMBEDFORGE_CONFIG_DIR EMBEDFORGE_CACHE_DIR
+  unset OPENAI_API_KEY OPENROUTER_API_KEY HF_TOKEN HUGGING_FACE_HUB_TOKEN
+}
+
+ensure_path() {
+  if command -v uv >/dev/null 2>&1; then
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "$LOGIN_HOME/.local/bin/uv" \
+    /opt/homebrew/bin/uv \
+    /usr/local/bin/uv \
+    /home/ubuntu/.local/bin/uv
+  do
+    if [[ -x "$candidate" ]]; then
+      export PATH="$(dirname "$candidate"):$PATH"
+      return 0
+    fi
+  done
+  die "uv is not on PATH; install https://astral.sh/uv then retry launch"
+}
+
+next_seq() {
+  local counter="$EVIDENCE/seq"
+  local n=1
+  if [[ -f "$counter" ]]; then
+    n=$(( $(cat "$counter") + 1 ))
+  fi
+  echo "$n" >"$counter"
+  printf '%02d' "$n"
+}
+
+slugify() {
+  echo "$*" | tr ' /' '--' | tr -cd '[:alnum:]._-' | cut -c1-48
+}
+
+cmd_launch() {
+  local run_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run-id)
+        [[ $# -ge 2 ]] || die "--run-id needs a value"
+        run_id="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown launch argument: $1"
+        ;;
+    esac
+  done
+  ensure_path
+  if [[ -z "$run_id" && -n "${REQUESTED_RUN_ID:-}" ]]; then
+    run_id="$REQUESTED_RUN_ID"
+  fi
+  RUN_ID="$(sanitize_run_id "${run_id:-${CONTROL_EMBED_RUN_ID:-$(date +%Y%m%dT%H%M%S)-$$}}")"
+  STATE_FILE="$(state_path "$RUN_ID")"
+  SCRATCH="${CONTROL_EMBED_SCRATCH:-${TMPDIR:-/tmp}/embedforge-verify-$RUN_ID}"
+  EVIDENCE="${CONTROL_EMBED_EVIDENCE:-$SKILL_DIR/artifacts/$RUN_ID}"
+  ISOLATED_HOME="$SCRATCH/home"
+  XDG_CONFIG_HOME="$SCRATCH/config"
+  XDG_CACHE_HOME="$SCRATCH/cache"
+  HF_HOME="$SCRATCH/hf"
+
+  mkdir -p "$ISOLATED_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$HF_HOME" "$EVIDENCE"
+  (
+    cd "$REPO_ROOT"
+    uv sync --group dev
+  )
+  write_state
+
+  apply_isolation
+  local help_out
+  help_out="$(cd "$REPO_ROOT" && uv run embed --help)"
+  printf '%s\n' "$help_out" >"$EVIDENCE/00-launch-help.txt"
+  printf '%s\n' "$help_out" | grep -q '^usage: embed' || die "embed --help did not print usage: embed"
+  printf '%s\n' "$help_out" | grep -q 'plan' || die "embed --help is missing plan"
+
+  cat >"$EVIDENCE/00-launch.json" <<EOF
+{
+  "run_id": "$RUN_ID",
+  "scratch": "$SCRATCH",
+  "evidence": "$EVIDENCE",
+  "home": "$ISOLATED_HOME",
+  "xdg_config_home": "$XDG_CONFIG_HOME",
+  "xdg_cache_home": "$XDG_CACHE_HOME",
+  "hf_home": "$HF_HOME",
+  "repo": "$REPO_ROOT",
+  "platform": "$(uname -s 2>/dev/null || echo unknown)"
+}
+EOF
+  echo "control-embed ready run_id=$RUN_ID scratch=$SCRATCH evidence=$EVIDENCE state=$STATE_FILE"
+}
+
+cmd_doctor() {
+  need_state
+  ensure_path
+  apply_isolation
+  local fail=0
+  local report="$EVIDENCE/doctor.txt"
+  {
+    echo "run_id=$RUN_ID"
+    echo "scratch=$SCRATCH"
+    echo "evidence=$EVIDENCE"
+    echo "home=$HOME"
+    echo "login_home=$LOGIN_HOME"
+    echo "platform=$(uname -s 2>/dev/null || echo unknown)"
+    echo "xdg_config_home=$XDG_CONFIG_HOME"
+    echo "xdg_cache_home=$XDG_CACHE_HOME"
+  } >"$report"
+
+  if [[ ! -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    echo "FAIL: $REPO_ROOT/.venv is missing; relaunch" | tee -a "$report"
+    fail=1
+  fi
+
+  local version
+  version="$(cd "$REPO_ROOT" && uv run python -c 'import embedforge; print(embedforge.__version__)')"
+  echo "version=$version" >>"$report"
+  if [[ "$version" != "0.1.0" ]]; then
+    echo "FAIL: unexpected embedforge version $version (expected 0.1.0)" | tee -a "$report"
+    fail=1
+  fi
+
+  local help_out
+  help_out="$(cd "$REPO_ROOT" && uv run embed --help)"
+  if ! printf '%s\n' "$help_out" | grep -q '  plan '; then
+    echo "FAIL: embed --help does not list plan" | tee -a "$report"
+    fail=1
+  fi
+
+  local config_json
+  config_json="$(cd "$REPO_ROOT" && uv run embed config --json)"
+  printf '%s\n' "$config_json" >"$EVIDENCE/doctor-config.json"
+  local cache_path config_path
+  cache_path="$(
+    cd "$REPO_ROOT"
+    printf '%s\n' "$config_json" | uv run python -c 'import json,sys; print(json.load(sys.stdin)["cache_path"])'
+  )"
+  config_path="$(
+    cd "$REPO_ROOT"
+    printf '%s\n' "$config_json" | uv run python -c 'import json,sys; print(json.load(sys.stdin)["config_path"])'
+  )"
+  echo "cache_path=$cache_path" >>"$report"
+  echo "config_path=$config_path" >>"$report"
+
+  local cache_expected config_expected
+  cache_expected="$XDG_CACHE_HOME/embedforge"
+  config_expected="$XDG_CONFIG_HOME/embedforge/config.toml"
+  echo "cache_path_canonical=$(normalize_path "$cache_path")" >>"$report"
+  echo "cache_expected_canonical=$(normalize_path "$cache_expected")" >>"$report"
+  if ! same_path "$cache_path" "$cache_expected"; then
+    echo "FAIL: cache_path is $cache_path; expected $cache_expected" | tee -a "$report"
+    fail=1
+  fi
+  if ! same_path "$config_path" "$config_expected"; then
+    echo "FAIL: config_path is $config_path; expected $config_expected" | tee -a "$report"
+    fail=1
+  fi
+  if same_path "$cache_path" "$DEFAULT_USER_CACHE"; then
+    echo "FAIL: instance shares the user cache $cache_path" | tee -a "$report"
+    fail=1
+  fi
+  if [[ -d "$DEFAULT_USER_CACHE" ]]; then
+    echo "WARN: $DEFAULT_USER_CACHE exists; this run must not write there" | tee -a "$report"
+  fi
+
+  if [[ "$fail" -ne 0 ]]; then
+    echo "control-embed doctor: FAIL"
+    exit 1
+  fi
+  echo "control-embed doctor: OK version=$version cache_path=$cache_path"
+}
+
+cmd_cli() {
+  need_state
+  ensure_path
+  apply_isolation
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+  [[ $# -gt 0 ]] || die "usage: control-embed cli -- <embed-args>"
+
+  local seq slug stdout_file stderr_file exit_file cmd_file transcript side_file
+  seq="$(next_seq)"
+  slug="$(slugify "$*")"
+  cmd_file="$EVIDENCE/${seq}-${slug}.cmd.txt"
+  stdout_file="$EVIDENCE/${seq}-${slug}.stdout.txt"
+  stderr_file="$EVIDENCE/${seq}-${slug}.stderr.txt"
+  exit_file="$EVIDENCE/${seq}-${slug}.exit.txt"
+  transcript="$EVIDENCE/${seq}-${slug}.transcript.txt"
+  side_file="$EVIDENCE/${seq}-${slug}.side-effects.txt"
+
+  {
+    printf 'uv run embed'
+    local arg
+    for arg in "$@"; do
+      printf ' %q' "$arg"
+    done
+    printf '\n'
+  } >"$cmd_file"
+  local code=0
+  (
+    cd "$REPO_ROOT"
+    uv run embed "$@"
+  ) >"$stdout_file" 2>"$stderr_file" || code=$?
+  echo "$code" >"$exit_file"
+
+  {
+    printf '$ '
+    cat "$cmd_file"
+    echo "--- stdout ---"
+    cat "$stdout_file"
+    echo "--- stderr ---"
+    cat "$stderr_file"
+    echo "--- exit ---"
+    echo "$code"
+  } >"$transcript"
+
+  {
+    echo "jobs_dir=$XDG_CACHE_HOME/embedforge/jobs"
+    if [[ -d "$XDG_CACHE_HOME/embedforge/jobs" ]]; then
+      ls -1 "$XDG_CACHE_HOME/embedforge/jobs"
+    else
+      echo "(absent)"
+    fi
+    echo
+    (cd "$REPO_ROOT" && uv run embed cache info) || true
+    echo
+    (cd "$REPO_ROOT" && uv run embed status) || true
+  } >"$side_file"
+
+  echo "control-embed cli exit=$code evidence=$transcript"
+  return "$code"
+}
+
+cmd_env() {
+  need_state
+  cat "$STATE_FILE"
+}
+
+cmd_cleanup() {
+  need_state
+  assert_scratch_owned
+  local session
+  if command -v tmux >/dev/null 2>&1; then
+    while read -r session; do
+      [[ -n "$session" ]] || continue
+      tmux kill-session -t "$session" 2>/dev/null || true
+    done < <(tmux ls -F '#{session_name}' 2>/dev/null | grep -E "^ef-verify-${RUN_ID}-" || true)
+  fi
+  if [[ -n "${SCRATCH:-}" && -d "$SCRATCH" ]]; then
+    rm -rf "$SCRATCH"
+  fi
+  rm -f "$STATE_FILE"
+  echo "control-embed cleanup: removed scratch=$SCRATCH kept evidence=$EVIDENCE"
+}
+
+help_without_getent() {
+  # Stock macOS has no getent. --help must still work when it is absent.
+  local tmp bindir cmd src code
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/ef-nogetent.XXXXXX")"
+  bindir="$tmp/bin"
+  mkdir -p "$bindir"
+  for cmd in bash dirname uname id awk cut true false cat printf echo; do
+    src="$(command -v "$cmd" || true)"
+    if [[ -n "$src" && -x "$src" && "$src" != /* ]]; then
+      src="$(command -v "$cmd")"
+    fi
+    if [[ -n "$src" && -x "$src" ]]; then
+      ln -sf "$src" "$bindir/$cmd"
+    fi
+  done
+  set +e
+  PATH="$bindir" "$bindir/bash" "$SKILL_DIR/bin/control-embed" --help >/dev/null
+  code=$?
+  set -e
+  rm -rf "$tmp"
+  [[ "$code" -eq 0 ]] || die "control-embed --help failed without getent on PATH (exit $code)"
+}
+
+cmd_smoke() {
+  local run_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run-id)
+        [[ $# -ge 2 ]] || die "--run-id needs a value"
+        run_id="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown smoke argument: $1"
+        ;;
+    esac
+  done
+  help_without_getent
+  if [[ -n "$run_id" ]]; then
+    cmd_launch --run-id "$run_id"
+  else
+    cmd_launch --run-id "smoke-$(date +%Y%m%dT%H%M%S)-$$"
+  fi
+  cmd_doctor
+  cmd_cli -- models --provider openai
+  cmd_cli -- config --json
+  local evidence="$EVIDENCE"
+  cmd_cleanup
+  [[ -d "$evidence" ]] || die "evidence missing after cleanup: $evidence"
+  echo "control-embed smoke: OK platform=$(uname -s 2>/dev/null || echo unknown) evidence=$evidence"
+}
+
+main() {
+  REQUESTED_RUN_ID=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run-id)
+        [[ $# -ge 2 ]] || die "--run-id needs a value"
+        REQUESTED_RUN_ID="$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    launch) cmd_launch "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    cli) cmd_cli "$@" ;;
+    env) cmd_env "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    smoke) cmd_smoke "$@" ;;
+    -h | --help | help | "") usage ;;
+    *)
+      usage >&2
+      die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"

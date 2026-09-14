@@ -15,3 +15,16 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run ty check src tests
       - run: uv run pytest
+
+  verify-cli:
+    name: verify-cli (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --group dev
+      - run: uv run pytest tests/test_control_embed_portability.py
+      - run: CONTROL_EMBED_RUN_ID=ci-smoke .cursor/skills/verify-embedforge/bin/control-embed smoke --run-id ci-smoke
