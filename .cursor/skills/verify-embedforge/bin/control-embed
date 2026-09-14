@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# Isolated harness for the EmbedForge `embed` CLI.
+# Invocation is documented in ../SKILL.md — do not reverse-engineer this file.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$SKILL_DIR/../../.." && pwd)"
+STATE_DIR="${CONTROL_EMBED_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/control-embed}"
+STATE_FILE="${CONTROL_EMBED_STATE:-$STATE_DIR/current.env}"
+DEFAULT_USER_CACHE="${HOME:-/home/ubuntu}/.cache/embedforge"
+
+usage() {
+  cat <<'EOF'
+usage: control-embed <command> [args]
+
+commands:
+  launch [--run-id ID]   sync the CLI and open an isolated scratch home/XDG
+  doctor                 read-only check that this instance is worth driving
+  cli -- <embed-args>    run `uv run embed ...` inside the scratch env
+  env                    print the isolation variables
+  cleanup                tear down scratch and sessions; keep evidence
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+need_state() {
+  [[ -f "$STATE_FILE" ]] || die "no active instance; run: $0 launch"
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  [[ -n "${RUN_ID:-}" && -n "${SCRATCH:-}" && -n "${EVIDENCE:-}" ]] || die "corrupt state file: $STATE_FILE"
+}
+
+write_state() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  cat >"$STATE_FILE" <<EOF
+RUN_ID=$(printf '%q' "$RUN_ID")
+REPO_ROOT=$(printf '%q' "$REPO_ROOT")
+SCRATCH=$(printf '%q' "$SCRATCH")
+EVIDENCE=$(printf '%q' "$EVIDENCE")
+ISOLATED_HOME=$(printf '%q' "$ISOLATED_HOME")
+XDG_CONFIG_HOME=$(printf '%q' "$XDG_CONFIG_HOME")
+XDG_CACHE_HOME=$(printf '%q' "$XDG_CACHE_HOME")
+HF_HOME=$(printf '%q' "$HF_HOME")
+EMBEDFORGE_USER_CACHE=$(printf '%q' "$DEFAULT_USER_CACHE")
+EOF
+}
+
+apply_isolation() {
+  export HOME="$ISOLATED_HOME"
+  export XDG_CONFIG_HOME
+  export XDG_CACHE_HOME
+  export HF_HOME
+  export HF_HUB_DISABLE_TELEMETRY=1
+  unset EMBEDFORGE_CONFIG_DIR EMBEDFORGE_CACHE_DIR
+  unset OPENAI_API_KEY OPENROUTER_API_KEY HF_TOKEN HUGGING_FACE_HUB_TOKEN
+}
+
+ensure_path() {
+  if ! command -v uv >/dev/null 2>&1; then
+    if [[ -x "$HOME/.local/bin/uv" ]]; then
+      export PATH="$HOME/.local/bin:$PATH"
+    elif [[ -x /home/ubuntu/.local/bin/uv ]]; then
+      export PATH="/home/ubuntu/.local/bin:$PATH"
+    else
+      die "uv is not on PATH; install https://astral.sh/uv then retry launch"
+    fi
+  fi
+}
+
+next_seq() {
+  local counter="$EVIDENCE/seq"
+  local n=1
+  if [[ -f "$counter" ]]; then
+    n=$(( $(cat "$counter") + 1 ))
+  fi
+  echo "$n" >"$counter"
+  printf '%02d' "$n"
+}
+
+slugify() {
+  echo "$*" | tr ' /' '--' | tr -cd '[:alnum:]._-' | cut -c1-48
+}
+
+cmd_launch() {
+  local run_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run-id)
+        [[ $# -ge 2 ]] || die "--run-id needs a value"
+        run_id="$2"
+        shift 2
+        ;;
+      *)
+        die "unknown launch argument: $1"
+        ;;
+    esac
+  done
+  ensure_path
+  RUN_ID="${run_id:-${CONTROL_EMBED_RUN_ID:-$(date +%Y%m%dT%H%M%S)-$$}}"
+  SCRATCH="${CONTROL_EMBED_SCRATCH:-/tmp/embedforge-verify-$RUN_ID}"
+  EVIDENCE="${CONTROL_EMBED_EVIDENCE:-$SKILL_DIR/artifacts/$RUN_ID}"
+  ISOLATED_HOME="$SCRATCH/home"
+  XDG_CONFIG_HOME="$SCRATCH/config"
+  XDG_CACHE_HOME="$SCRATCH/cache"
+  HF_HOME="$SCRATCH/hf"
+
+  mkdir -p "$ISOLATED_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$HF_HOME" "$EVIDENCE"
+  (
+    cd "$REPO_ROOT"
+    uv sync --group dev
+  )
+  write_state
+
+  apply_isolation
+  local help_out
+  help_out="$(cd "$REPO_ROOT" && uv run embed --help)"
+  printf '%s\n' "$help_out" >"$EVIDENCE/00-launch-help.txt"
+  grep -q '^usage: embed' <<<"$help_out" || die "embed --help did not print usage: embed"
+  grep -q 'plan' <<<"$help_out" || die "embed --help is missing plan"
+
+  cat >"$EVIDENCE/00-launch.json" <<EOF
+{
+  "run_id": "$RUN_ID",
+  "scratch": "$SCRATCH",
+  "evidence": "$EVIDENCE",
+  "home": "$ISOLATED_HOME",
+  "xdg_config_home": "$XDG_CONFIG_HOME",
+  "xdg_cache_home": "$XDG_CACHE_HOME",
+  "hf_home": "$HF_HOME",
+  "repo": "$REPO_ROOT"
+}
+EOF
+  echo "control-embed ready run_id=$RUN_ID scratch=$SCRATCH evidence=$EVIDENCE"
+}
+
+cmd_doctor() {
+  need_state
+  ensure_path
+  apply_isolation
+  local fail=0
+  local report="$EVIDENCE/doctor.txt"
+  {
+    echo "run_id=$RUN_ID"
+    echo "scratch=$SCRATCH"
+    echo "evidence=$EVIDENCE"
+    echo "home=$HOME"
+    echo "xdg_config_home=$XDG_CONFIG_HOME"
+    echo "xdg_cache_home=$XDG_CACHE_HOME"
+  } >"$report"
+
+  if [[ ! -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    echo "FAIL: $REPO_ROOT/.venv is missing; relaunch" | tee -a "$report"
+    fail=1
+  fi
+
+  local version
+  version="$(cd "$REPO_ROOT" && uv run python -c 'import embedforge; print(embedforge.__version__)')"
+  echo "version=$version" >>"$report"
+  if [[ "$version" != "0.1.0" ]]; then
+    echo "FAIL: unexpected embedforge version $version (expected 0.1.0)" | tee -a "$report"
+    fail=1
+  fi
+
+  local help_out
+  help_out="$(cd "$REPO_ROOT" && uv run embed --help)"
+  if ! grep -q '  plan ' <<<"$help_out"; then
+    echo "FAIL: embed --help does not list plan" | tee -a "$report"
+    fail=1
+  fi
+
+  local config_json
+  config_json="$(cd "$REPO_ROOT" && uv run embed config --json)"
+  printf '%s\n' "$config_json" >"$EVIDENCE/doctor-config.json"
+  local cache_path config_path
+  cache_path="$(cd "$REPO_ROOT" && uv run python -c 'import json,sys; print(json.load(sys.stdin)["cache_path"])' <<<"$config_json")"
+  config_path="$(cd "$REPO_ROOT" && uv run python -c 'import json,sys; print(json.load(sys.stdin)["config_path"])' <<<"$config_json")"
+  echo "cache_path=$cache_path" >>"$report"
+  echo "config_path=$config_path" >>"$report"
+
+  if [[ "$cache_path" != "$XDG_CACHE_HOME/embedforge" ]]; then
+    echo "FAIL: cache_path is $cache_path; expected $XDG_CACHE_HOME/embedforge" | tee -a "$report"
+    fail=1
+  fi
+  if [[ "$config_path" != "$XDG_CONFIG_HOME/embedforge/config.toml" ]]; then
+    echo "FAIL: config_path is $config_path; expected $XDG_CONFIG_HOME/embedforge/config.toml" | tee -a "$report"
+    fail=1
+  fi
+  if [[ "$cache_path" == "$DEFAULT_USER_CACHE" || "$cache_path" == /home/ubuntu/.cache/embedforge ]]; then
+    echo "FAIL: instance shares the user cache $cache_path" | tee -a "$report"
+    fail=1
+  fi
+  if [[ -d /home/ubuntu/.cache/embedforge ]]; then
+    echo "WARN: /home/ubuntu/.cache/embedforge exists; this run must not write there" | tee -a "$report"
+  fi
+
+  if [[ "$fail" -ne 0 ]]; then
+    echo "control-embed doctor: FAIL"
+    exit 1
+  fi
+  echo "control-embed doctor: OK version=$version cache_path=$cache_path"
+}
+
+cmd_cli() {
+  need_state
+  ensure_path
+  apply_isolation
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+  [[ $# -gt 0 ]] || die "usage: control-embed cli -- <embed-args>"
+
+  local seq slug stdout_file stderr_file exit_file cmd_file transcript side_file
+  seq="$(next_seq)"
+  slug="$(slugify "$*")"
+  cmd_file="$EVIDENCE/${seq}-${slug}.cmd.txt"
+  stdout_file="$EVIDENCE/${seq}-${slug}.stdout.txt"
+  stderr_file="$EVIDENCE/${seq}-${slug}.stderr.txt"
+  exit_file="$EVIDENCE/${seq}-${slug}.exit.txt"
+  transcript="$EVIDENCE/${seq}-${slug}.transcript.txt"
+  side_file="$EVIDENCE/${seq}-${slug}.side-effects.txt"
+
+  printf 'uv run embed %q ' "$@" | sed 's/ $/\n/' >"$cmd_file"
+  local code=0
+  (
+    cd "$REPO_ROOT"
+    uv run embed "$@"
+  ) >"$stdout_file" 2>"$stderr_file" || code=$?
+  echo "$code" >"$exit_file"
+
+  {
+    echo "\$ uv run embed $*"
+    echo "--- stdout ---"
+    cat "$stdout_file"
+    echo "--- stderr ---"
+    cat "$stderr_file"
+    echo "--- exit ---"
+    echo "$code"
+  } >"$transcript"
+
+  {
+    echo "jobs_dir=$XDG_CACHE_HOME/embedforge/jobs"
+    if [[ -d "$XDG_CACHE_HOME/embedforge/jobs" ]]; then
+      ls -1 "$XDG_CACHE_HOME/embedforge/jobs"
+    else
+      echo "(absent)"
+    fi
+    echo
+    (cd "$REPO_ROOT" && uv run embed cache info) || true
+    echo
+    (cd "$REPO_ROOT" && uv run embed status) || true
+  } >"$side_file"
+
+  echo "control-embed cli exit=$code evidence=$transcript"
+  return "$code"
+}
+
+cmd_env() {
+  need_state
+  cat "$STATE_FILE"
+}
+
+cmd_cleanup() {
+  if [[ ! -f "$STATE_FILE" ]]; then
+    echo "control-embed cleanup: nothing to tear down"
+    return 0
+  fi
+  # shellcheck disable=SC1090
+  source "$STATE_FILE"
+  local session
+  if command -v tmux >/dev/null 2>&1; then
+    while read -r session; do
+      [[ -n "$session" ]] || continue
+      tmux kill-session -t "$session" 2>/dev/null || true
+    done < <(tmux ls -F '#{session_name}' 2>/dev/null | grep -E "^ef-verify-${RUN_ID}-" || true)
+  fi
+  if [[ -n "${SCRATCH:-}" && -d "$SCRATCH" ]]; then
+    rm -rf "$SCRATCH"
+  fi
+  rm -f "$STATE_FILE"
+  echo "control-embed cleanup: removed scratch=$SCRATCH kept evidence=$EVIDENCE"
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    launch) cmd_launch "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    cli) cmd_cli "$@" ;;
+    env) cmd_env "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    -h | --help | help | "") usage ;;
+    *)
+      usage >&2
+      die "unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
