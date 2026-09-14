@@ -340,6 +340,7 @@ def publish_job(
                 job.source.repository,
                 job.embedding.provider,
                 job.embedding.model,
+                dimensions=job.embedding.dimensions,
                 namespace=resolved_ns,
             )
             if "/" not in repo_id:

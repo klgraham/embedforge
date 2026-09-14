@@ -26,11 +26,13 @@ def default_output_repo(
     provider: str,
     model: str,
     *,
+    dimensions: int,
     namespace: str | None,
 ) -> str:
+    """Name the destination `{dataset}-{provider}-{model}-{dimensions}`."""
     dataset = sanitize_repo_piece(repository.split("/")[-1])
     model_slug = sanitize_repo_piece(model.split("/")[-1])
-    name = f"{dataset}-{provider}-{model_slug}"
+    name = f"{dataset}-{provider}-{model_slug}-{dimensions}"
     if namespace:
         return f"{namespace}/{name}"
     return name
@@ -113,6 +115,7 @@ def build_plan(
             repository,
             settings.provider,
             settings.model,
+            dimensions=settings.dimensions,
             namespace=resolved.hf_namespace,
         ),
         column=settings.column,

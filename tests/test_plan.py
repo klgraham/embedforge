@@ -30,7 +30,7 @@ def test_plan_does_not_call_embedding_provider(monkeypatch) -> None:
     assert plan.embedding.provider == "openai"
     assert plan.embedding.model == "text-embedding-3-small"
     assert plan.embedding.dimensions == 1536
-    assert plan.output.repo == "klogram/fiqa-openai-text-embedding-3-small"
+    assert plan.output.repo == "klogram/fiqa-openai-text-embedding-3-small-1536"
     assert plan.output.column == "embedding"
     assert plan.estimates.rows == 2
     assert plan.estimates.tokens > 0
@@ -62,7 +62,21 @@ def test_default_output_repo_normalizes_provider_independent_model() -> None:
             "BeIR/fiqa",
             "openai",
             "openai/text-embedding-3-small",
+            dimensions=1536,
             namespace=None,
         )
-        == "fiqa-openai-text-embedding-3-small"
+        == "fiqa-openai-text-embedding-3-small-1536"
     )
+
+
+def test_plan_output_repo_uses_requested_dimensions() -> None:
+    source = FakeDatasetSource(rows=[{"text": "hello"}])
+    plan = build_plan(
+        "acme/fiqa",
+        column="text",
+        dimensions=512,
+        config=Config(provider="openai", model="text-embedding-3-small"),
+        source=source,
+    )
+    assert plan.embedding.dimensions == 512
+    assert plan.output.repo == "fiqa-openai-text-embedding-3-small-512"
