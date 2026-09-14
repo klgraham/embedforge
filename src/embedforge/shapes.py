@@ -42,6 +42,12 @@ class JobStatus(StrEnum):
     PUBLISHED = "published"
 
 
+class RowStatus(StrEnum):
+    SUCCESS = "success"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 

@@ -355,6 +355,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         args.job_id,
         repo=args.repo,
         private=private,
+        allow_public=bool(args.public),
         revision=args.revision,
     )
     print(_format_publish(result))
@@ -423,7 +424,7 @@ def _format_plan(plan: Plan) -> str:
             f"  Dataset:     {source.repository}",
             f"  Revision:    {source.revision}",
             f"  Config:      {source.config or 'default'}",
-            f"  Split:       {source.split or 'unknown'}",
+            f"  Split:       {source.split or 'all'}",
             f"  Column:      {', '.join(embedding.source_columns)}",
             "",
             "Embedding",

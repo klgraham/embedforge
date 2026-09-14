@@ -65,34 +65,45 @@ def build_plan(
             f"column {column!r} is not in the dataset; "
             f"candidates: {', '.join(report.candidate_text_columns) or 'none'}"
         )
+    output_name = output_column or resolved.output_column
+    if output_name in {item.name for item in report.columns}:
+        raise EmbedForgeError(f"output column {output_name!r} collides with a source column")
     chosen_provider = provider or resolved.provider
     chosen_model = model or resolved.model
     chosen_dimensions = dimensions if dimensions is not None else resolved.dimensions
     info = resolve_model(chosen_provider, chosen_model, chosen_dimensions)
-    stats = gateway.character_stats(
-        DatasetRequest(
-            repository=repository,
-            config=report.config,
-            split=report.split,
-            revision=report.revision,
-        ),
-        column,
-    )
-    rows = stats.rows or report.estimated_rows
-    if limit is not None:
-        rows = min(rows, limit)
-        if stats.rows:
-            characters = int(stats.estimated_characters * (rows / stats.rows))
-        else:
-            characters = stats.estimated_characters
-    else:
-        characters = stats.estimated_characters
+    split_names = (split,) if split is not None else tuple(report.splits) or (report.split,)
+    rows = 0
+    characters = 0
+    for split_name in split_names:
+        if split_name is None:
+            continue
+        stats = gateway.character_stats(
+            DatasetRequest(
+                repository=repository,
+                config=report.config,
+                split=split_name,
+                revision=report.revision,
+            ),
+            column,
+        )
+        take = stats.rows or 0
+        split_chars = stats.estimated_characters
+        if limit is not None and take:
+            take = min(take, limit)
+            if stats.rows:
+                split_chars = int(stats.estimated_characters * (take / stats.rows))
+        rows += take
+        characters += split_chars
+    if rows == 0:
+        rows = report.estimated_rows if limit is None else min(report.estimated_rows, limit)
+        characters = report.estimated_characters
     tokens = estimate_tokens(characters)
     settings = EmbeddingSettings(
         provider=info.provider.value,
         model=info.model,
         dimensions=info.dimensions,
-        column=output_column or resolved.output_column,
+        column=output_name,
         source_columns=(column,),
         batch_size=resolved.batch_size,
         concurrency=resolved.concurrency,
@@ -107,7 +118,7 @@ def build_plan(
         column=settings.column,
     )
     return Plan(
-        source=source_from_report(report),
+        source=source_from_report(report, requested_split=split),
         embedding=settings,
         output=output,
         estimates=Estimates(
@@ -120,11 +131,11 @@ def build_plan(
     )
 
 
-def source_from_report(report: InspectReport) -> SourceRef:
+def source_from_report(report: InspectReport, *, requested_split: str | None) -> SourceRef:
     return SourceRef(
         repository=report.repository,
         revision=report.revision,
         config=report.config,
-        split=report.split,
+        split=requested_split,
         license=report.license,
     )

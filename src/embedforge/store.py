@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from embedforge.errors import EmbedForgeError
 from embedforge.paths import job_dir, jobs_dir
-from embedforge.shapes import Job, Plan, Provenance, utc_now
+from embedforge.shapes import Job, Plan, Provenance, RowStatus, utc_now
 
 _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -28,11 +29,24 @@ def new_ulid() -> str:
     return "".join(chars)
 
 
-def write_json(path: Path, data: object) -> None:
+def write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
     tmp.replace(path)
+
+
+def write_json(path: Path, data: object) -> None:
+    write_text_atomic(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+@dataclass(frozen=True)
+class EmbeddingRecord:
+    split: str
+    index: int
+    status: RowStatus
+    cache_key: str | None
+    embedding: list[float] | None
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -89,33 +103,71 @@ class JobStore:
         return self.directory(job_id) / "embeddings.jsonl"
 
     def append_embedding(
-        self, job_id: str, index: int, key: str | None, vector: list[float] | None
+        self,
+        job_id: str,
+        index: int,
+        key: str | None,
+        vector: list[float] | None,
+        *,
+        status: RowStatus,
+        split: str,
     ) -> None:
-        record = {"index": index, "cache_key": key, "embedding": vector}
+        record = {
+            "split": split,
+            "index": index,
+            "status": status.value,
+            "cache_key": key,
+            "embedding": vector,
+        }
         path = self.embeddings_path(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
 
-    def load_embeddings(self, job_id: str) -> dict[int, list[float] | None]:
+    def load_records(self, job_id: str) -> dict[tuple[str, int], EmbeddingRecord]:
         path = self.embeddings_path(job_id)
         if not path.exists():
             return {}
-        loaded: dict[int, list[float] | None] = {}
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            raw = json.loads(line)
+        loaded: dict[tuple[str, int], EmbeddingRecord] = {}
+        lines = [line for line in path.read_text().splitlines() if line.strip()]
+        for offset, line in enumerate(lines):
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                if offset == len(lines) - 1:
+                    break
+                raise EmbedForgeError(f"corrupt embeddings journal in job {job_id}") from None
             if not isinstance(raw, dict):
                 continue
             index = raw.get("index")
             if not isinstance(index, int) or isinstance(index, bool):
                 continue
+            split_raw = raw.get("split", "train")
+            split = split_raw if isinstance(split_raw, str) and split_raw else "train"
+            status = _record_status(raw)
             embedding = raw.get("embedding")
+            vector: list[float] | None
             if embedding is None:
-                loaded[index] = None
+                vector = None
             elif isinstance(embedding, list):
-                loaded[index] = [float(item) for item in embedding]
+                vector = [float(item) for item in embedding]
+            else:
+                continue
+            key_raw = raw.get("cache_key")
+            cache_key = key_raw if isinstance(key_raw, str) else None
+            loaded[(split, index)] = EmbeddingRecord(
+                split=split,
+                index=index,
+                status=status,
+                cache_key=cache_key,
+                embedding=vector,
+            )
+        return loaded
+
+    def load_embeddings(self, job_id: str) -> dict[int, list[float] | None]:
+        loaded: dict[int, list[float] | None] = {}
+        for (_split, index), record in self.load_records(job_id).items():
+            loaded[index] = record.embedding
         return loaded
 
     def list_jobs(self) -> list[Job]:
@@ -149,3 +201,15 @@ class JobStore:
         )
         self.save_job(updated)
         return updated
+
+
+def _record_status(raw: dict[str, Any]) -> RowStatus:
+    status_raw = raw.get("status")
+    if isinstance(status_raw, str):
+        try:
+            return RowStatus(status_raw)
+        except ValueError:
+            pass
+    if isinstance(raw.get("embedding"), list):
+        return RowStatus.SUCCESS
+    return RowStatus.FAILED

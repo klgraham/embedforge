@@ -10,6 +10,7 @@ from typing import Any
 
 from embedforge.paths import embeddings_cache_dir
 from embedforge.shapes import utc_now
+from embedforge.store import write_text_atomic
 
 
 def cache_key(provider: str, model: str, dimensions: int, text: str) -> str:
@@ -71,7 +72,6 @@ class EmbeddingCache:
     ) -> str:
         key = cache_key(provider, model, dimensions, text)
         path = self.path_for(key)
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = CacheEntry(
             key=key,
             provider=provider,
@@ -80,7 +80,7 @@ class EmbeddingCache:
             embedding=tuple(float(item) for item in embedding),
             created_at=utc_now(),
         )
-        path.write_text(json.dumps(entry.to_dict(), indent=2) + "\n")
+        write_text_atomic(path, json.dumps(entry.to_dict(), indent=2) + "\n")
         return key
 
     def list_entries(self) -> list[CacheEntry]:

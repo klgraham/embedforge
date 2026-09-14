@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import embedforge.plan as plan_mod
 import embedforge.providers as providers_mod
+from embedforge.errors import EmbedForgeError
 from embedforge.plan import build_plan, default_output_repo
 from embedforge.shapes import Config
 from tests.fakes import FakeDatasetSource, FakeEmbedder
@@ -43,6 +44,16 @@ def test_plan_limit_reduces_estimates() -> None:
     assert limited.estimates.rows == 2
     assert limited.estimates.characters < full.estimates.characters
     assert limited.estimates.cost_usd < full.estimates.cost_usd
+
+
+def test_plan_rejects_output_column_collision() -> None:
+    source = FakeDatasetSource(rows=[{"text": "hello"}])
+    try:
+        build_plan("acme/fiqa", column="text", output_column="text", source=source)
+    except EmbedForgeError as exc:
+        assert "collides" in str(exc)
+    else:
+        raise AssertionError("expected colliding output column to fail before embedding")
 
 
 def test_default_output_repo_normalizes_provider_independent_model() -> None:

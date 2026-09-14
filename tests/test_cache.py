@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from embedforge.cache import EmbeddingCache, cache_key
 from embedforge.run import start_or_resume
-from embedforge.shapes import Config
+from embedforge.shapes import Config, RowStatus
 from embedforge.store import JobStore
 from tests.fakes import FakeDatasetSource, FakeEmbedder
 
@@ -60,3 +60,18 @@ def test_cache_put_get_roundtrip(tmp_path) -> None:
     assert info["entries"] == 1
     assert cache.clean() == 1
     assert cache.list_entries() == []
+
+
+def test_journal_recovers_incomplete_trailing_record(tmp_path) -> None:
+    store = JobStore(tmp_path / "jobs")
+    job_id = "01TESTJOURNAL000000000000"
+    (store.root / job_id).mkdir(parents=True)
+    path = store.embeddings_path(job_id)
+    path.write_text(
+        '{"split":"train","index":0,"status":"success","cache_key":"k","embedding":[1.0]}\n'
+        '{"split":"train","index":1,"status":"success","cache_key":"k","embedding":[2.0'
+    )
+    records = store.load_records(job_id)
+    assert set(records) == {("train", 0)}
+    assert records[("train", 0)].status is RowStatus.SUCCESS
+    assert records[("train", 0)].embedding == [1.0]

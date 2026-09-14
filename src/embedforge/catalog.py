@@ -159,6 +159,21 @@ def resolve_model(
     )
 
 
+def api_dimensions(model: str, expected: int) -> int | None:
+    """Return the optional API dimensions parameter.
+
+    Expected vector size is always recorded on the job. Ada-002 and other
+    fixed-size models reject `dimensions`, so they receive None.
+    """
+    matches = find_models(model)
+    if not matches:
+        return expected
+    info = matches[0]
+    if not info.configurable_dimensions:
+        return None
+    return expected
+
+
 def estimate_tokens(characters: int) -> int:
     if characters <= 0:
         return 0

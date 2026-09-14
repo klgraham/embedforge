@@ -6,10 +6,10 @@ import math
 from collections import Counter
 from typing import Any
 
-from datasets import Dataset, load_from_disk
+from datasets import Dataset, DatasetDict, load_from_disk
 
 from embedforge.errors import EmbedForgeError
-from embedforge.hfdata import DatasetRequest, DatasetSource, HuggingFaceDatasetSource
+from embedforge.hfdata import DatasetRequest, DatasetSource, HuggingFaceDatasetSource, LoadedDataset
 from embedforge.shapes import (
     Check,
     Diagnostic,
@@ -35,9 +35,7 @@ def validate_job(
     output = job_store.output_dir(job_id)
     if not output.exists():
         raise EmbedForgeError(f"job {job_id} has no staged output; run it first")
-    dataset = load_from_disk(str(output))
-    if not isinstance(dataset, Dataset):
-        raise EmbedForgeError("staged output must be a single dataset split")
+    staged = _load_staged(output)
 
     gateway = source or HuggingFaceDatasetSource()
     loaded = gateway.load_rows(
@@ -51,17 +49,18 @@ def validate_job(
     )
 
     checks = [
-        _check_row_counts(dataset, loaded.rows),
-        _check_split(job),
-        _check_source_columns(dataset, loaded.columns),
-        _check_embedding_column(dataset, job.embedding.column),
-        _check_dimensions(dataset, job.embedding.column, job.embedding.dimensions),
-        _check_finite(dataset, job.embedding.column),
+        _check_row_counts(staged, loaded),
+        _check_split(job, staged, loaded),
+        _check_source_columns(staged, loaded.columns),
+        _check_embedding_column(staged, job.embedding.column),
+        _check_dimensions(staged, job.embedding.column, job.embedding.dimensions),
+        _check_finite(staged, job.embedding.column),
         _check_revision(job, provenance.source.revision),
         _check_model_metadata(job, provenance),
         _check_license(job, provenance.source.license),
+        _check_config(job),
     ]
-    diagnostics = _diagnostics(dataset, job.embedding.column)
+    diagnostics = _diagnostics(staged, job.embedding.column)
     result = ValidationResult(
         ok=all(check.passed for check in checks),
         checks=tuple(checks),
@@ -72,36 +71,57 @@ def validate_job(
     return result
 
 
+def _load_staged(output: object) -> DatasetDict:
+    raw = load_from_disk(str(output))
+    if isinstance(raw, DatasetDict):
+        return raw
+    if isinstance(raw, Dataset):
+        name = getattr(raw, "split", None)
+        split_name = name if isinstance(name, str) and name else "train"
+        return DatasetDict({split_name: raw})
+    raise EmbedForgeError("staged output must be a dataset or dataset dict")
+
+
+def _iter_splits(staged: DatasetDict) -> list[tuple[str, Dataset]]:
+    return [(str(name), staged[name]) for name in staged]
+
+
 def _column(dataset: Dataset, name: str) -> list[Any]:
     if name not in dataset.column_names:
         return []
     return list(dataset[name])
 
 
-def _check_row_counts(dataset: Dataset, source_rows: list[dict[str, object]]) -> Check:
-    actual = len(dataset)
-    expected = len(source_rows)
+def _check_row_counts(staged: DatasetDict, loaded: LoadedDataset) -> Check:
+    expected = {item.name: len(item.rows) for item in loaded.splits}
+    actual = {name: len(dataset) for name, dataset in _iter_splits(staged)}
     passed = actual == expected
     return Check(
         name="source_row_counts",
         passed=passed,
-        message=f"output has {actual} rows; source has {expected}",
+        message=f"output splits {actual}; source splits {expected}",
     )
 
 
-def _check_split(job: Job) -> Check:
-    passed = bool(job.source.split)
+def _check_split(job: Job, staged: DatasetDict, loaded: LoadedDataset) -> Check:
+    actual = set(staged.keys())
+    expected = set(loaded.split_names())
+    if job.source.split is not None:
+        expected = {job.source.split}
+    passed = actual == expected and bool(actual)
     return Check(
         name="split_structure",
         passed=passed,
-        message=f"source split recorded as {job.source.split!r}"
-        if passed
-        else "source split was not recorded",
+        message=f"staged splits {sorted(actual)}; expected {sorted(expected)}",
     )
 
 
-def _check_source_columns(dataset: Dataset, source_columns: tuple[str, ...]) -> Check:
-    missing = [name for name in source_columns if name not in dataset.column_names]
+def _check_source_columns(staged: DatasetDict, source_columns: tuple[str, ...]) -> Check:
+    missing: list[str] = []
+    for name, dataset in _iter_splits(staged):
+        missing.extend(
+            f"{name}.{column}" for column in source_columns if column not in dataset.column_names
+        )
     passed = not missing
     return Check(
         name="source_columns",
@@ -112,36 +132,46 @@ def _check_source_columns(dataset: Dataset, source_columns: tuple[str, ...]) -> 
     )
 
 
-def _check_embedding_column(dataset: Dataset, column: str) -> Check:
-    passed = column in dataset.column_names
+def _check_embedding_column(staged: DatasetDict, column: str) -> Check:
+    missing = [name for name, dataset in _iter_splits(staged) if column not in dataset.column_names]
+    passed = not missing
     return Check(
         name="embedding_column",
         passed=passed,
-        message=f"column {column!r} present" if passed else f"column {column!r} missing",
+        message=f"column {column!r} present"
+        if passed
+        else f"column {column!r} missing from {', '.join(missing)}",
     )
 
 
-def _vectors(dataset: Dataset, column: str) -> list[list[float] | None]:
+def _vectors(staged: DatasetDict, column: str) -> list[list[float] | None]:
     values: list[list[float] | None] = []
-    for item in _column(dataset, column):
-        if item is None:
-            values.append(None)
-        elif isinstance(item, list) and all(isinstance(num, (int, float)) for num in item):
-            values.append([float(num) for num in item])
-        else:
-            values.append(None)
+    for _name, dataset in _iter_splits(staged):
+        if column not in dataset.column_names:
+            continue
+        for item in _column(dataset, column):
+            if item is None:
+                values.append(None)
+            elif isinstance(item, list) and all(isinstance(num, (int, float)) for num in item):
+                values.append([float(num) for num in item])
+            else:
+                values.append(None)
     return values
 
 
-def _check_dimensions(dataset: Dataset, column: str, expected: int) -> Check:
-    if column not in dataset.column_names:
+def _check_dimensions(staged: DatasetDict, column: str, expected: int) -> Check:
+    missing_cols = [
+        name for name, dataset in _iter_splits(staged) if column not in dataset.column_names
+    ]
+    if missing_cols:
         return Check(
             name="uniform_dimensions",
             passed=False,
             message="embedding column missing",
         )
-    dims = {len(vector) for vector in _vectors(dataset, column) if vector is not None}
-    missing = sum(1 for vector in _vectors(dataset, column) if vector is None)
+    vectors = _vectors(staged, column)
+    dims = {len(vector) for vector in vectors if vector is not None}
+    missing = sum(1 for vector in vectors if vector is None)
     passed = dims == {expected} and missing == 0
     if not dims:
         message = f"{missing} rows missing embeddings"
@@ -152,9 +182,9 @@ def _check_dimensions(dataset: Dataset, column: str, expected: int) -> Check:
     return Check(name="uniform_dimensions", passed=passed, message=message)
 
 
-def _check_finite(dataset: Dataset, column: str) -> Check:
+def _check_finite(staged: DatasetDict, column: str) -> Check:
     bad = 0
-    for vector in _vectors(dataset, column):
+    for vector in _vectors(staged, column):
         if vector is None:
             continue
         if any(not math.isfinite(value) for value in vector):
@@ -206,8 +236,17 @@ def _check_license(job: Job, provenance_license: str | None) -> Check:
     )
 
 
-def _diagnostics(dataset: Dataset, column: str) -> list[Diagnostic]:
-    vectors = [vector for vector in _vectors(dataset, column) if vector is not None]
+def _check_config(job: Job) -> Check:
+    passed = bool(job.source.config)
+    return Check(
+        name="source_config",
+        passed=passed,
+        message=f"config {job.source.config}" if passed else "source config was not recorded",
+    )
+
+
+def _diagnostics(staged: DatasetDict, column: str) -> list[Diagnostic]:
+    vectors = [vector for vector in _vectors(staged, column) if vector is not None]
     if not vectors:
         return [
             Diagnostic(name="mean_vector_norm", message="no embeddings to diagnose"),

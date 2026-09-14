@@ -7,15 +7,16 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Never
 
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 
 from embedforge import __version__
 from embedforge.cache import EmbeddingCache, cache_key
-from embedforge.catalog import estimate_cost_usd, resolve_model
+from embedforge.catalog import api_dimensions, estimate_cost_usd, resolve_model
 from embedforge.config import apply_overrides, load_config
 from embedforge.errors import EmbedForgeError
-from embedforge.hfdata import DatasetRequest, DatasetSource, HuggingFaceDatasetSource
+from embedforge.hfdata import DatasetRequest, DatasetSource, HuggingFaceDatasetSource, LoadedDataset
 from embedforge.plan import build_plan
 from embedforge.providers import EmbedBatch, Embedder, get_embedder
 from embedforge.shapes import (
@@ -25,12 +26,14 @@ from embedforge.shapes import (
     JobStatus,
     Plan,
     Provenance,
+    RowStatus,
     replace_job,
     utc_now,
 )
-from embedforge.store import JobStore, new_ulid
+from embedforge.store import EmbeddingRecord, JobStore, new_ulid
 
 ProgressCallback = Callable[[str], None]
+WorkItem = tuple[str, int, str]
 
 
 @dataclass
@@ -75,7 +78,6 @@ def start_or_resume(
     )
     if resume_id:
         job = job_store.load(resume_id)
-        plan = job_store.load_plan(resume_id)
         if job.status is JobStatus.PUBLISHED:
             raise EmbedForgeError(f"job {job.id} is already published")
         if job.status is JobStatus.COMPLETED and job.progress.failed == 0:
@@ -176,39 +178,86 @@ def execute_job(
         ),
         limit=job.limit,
     )
-    column = job.embedding.source_columns[0]
-    texts = [_as_text(row.get(column)) for row in loaded.rows]
-    existing = store.load_embeddings(job.id)
-    progress = job.progress
+    if job.embedding.column in loaded.columns:
+        raise EmbedForgeError(
+            f"output column {job.embedding.column!r} collides with a source column"
+        )
+    items = _work_items(loaded, job.embedding.source_columns[0])
+    records = store.load_records(job.id)
     started = time.monotonic()
     job = replace_job(job, status=JobStatus.RUNNING, error=None)
     store.save_job(job)
+    request_dims = api_dimensions(job.embedding.model, job.embedding.dimensions)
+    model_info = resolve_model(
+        job.embedding.provider, job.embedding.model, job.embedding.dimensions
+    )
 
     try:
-        next_index = progress.next_index
-        while next_index < len(texts):
-            window = min(
-                job.embedding.batch_size * job.embedding.concurrency,
-                len(texts) - next_index,
+        pending = _pending_items(items, records, job, store, cache)
+        session_embedded = 0
+        tokens = job.progress.tokens
+        cost = job.progress.cost_usd
+        unique = _dedupe_pending(pending, job)
+        windows = _chunk(unique, job.embedding.batch_size)
+        for window in _group_windows(windows, job.embedding.concurrency):
+            texts_by_chunk = [[text for _key, text in chunk] for chunk in window]
+            batch_results = _embed_chunks(texts_by_chunk, job, embedder, request_dims)
+            for chunk, result in zip(window, batch_results, strict=True):
+                batch, batch_error = result
+                if batch_error is not None or batch is None:
+                    for key, text in chunk:
+                        try:
+                            single = embedder.embed(
+                                [text],
+                                model=job.embedding.model,
+                                dimensions=request_dims,
+                            )
+                        except Exception:
+                            _persist_group(
+                                pending,
+                                key,
+                                job,
+                                store,
+                                records,
+                                status=RowStatus.FAILED,
+                                vector=None,
+                                cache_key_value=None,
+                            )
+                            continue
+                        tokens += single.tokens
+                        cost += estimate_cost_usd(single.tokens, model_info.usd_per_million_tokens)
+                        session_embedded += _store_unique_success(
+                            job, cache, store, records, key, text, single.vectors[0], pending
+                        )
+                    continue
+                tokens += batch.tokens
+                cost += estimate_cost_usd(batch.tokens, model_info.usd_per_million_tokens)
+                for (key, text), vector in zip(chunk, batch.vectors, strict=True):
+                    session_embedded += _store_unique_success(
+                        job, cache, store, records, key, text, vector, pending
+                    )
+            records = store.load_records(job.id)
+            progress = _progress_from_records(
+                items,
+                records,
+                session_embedded=session_embedded,
+                tokens=tokens,
+                cost_usd=cost,
             )
-            indexes = list(range(next_index, next_index + window))
-            progress = _embed_window(
-                texts=texts,
-                indexes=indexes,
-                job=job,
-                store=store,
-                cache=cache,
-                embedder=embedder,
-                existing=existing,
-                progress=progress,
-            )
-            next_index += window
             job = replace_job(job, status=JobStatus.RUNNING, progress=progress)
             store.save_job(job)
             if on_progress:
-                elapsed = time.monotonic() - started
-                on_progress(_progress_line(progress, elapsed))
-        output_path = _materialize_dataset(job, loaded.rows, loaded.columns, store)
+                on_progress(_progress_line(progress, time.monotonic() - started))
+
+        records = store.load_records(job.id)
+        progress = _progress_from_records(
+            items,
+            records,
+            session_embedded=session_embedded,
+            tokens=tokens,
+            cost_usd=cost,
+        )
+        output_path = _materialize_dataset(job, loaded, store, records)
         status = JobStatus.COMPLETED if progress.failed == 0 else JobStatus.FAILED
         job = replace_job(
             job,
@@ -218,8 +267,7 @@ def execute_job(
         )
         store.save_job(job)
         if on_progress:
-            elapsed = time.monotonic() - started
-            on_progress(_progress_line(progress, elapsed))
+            on_progress(_progress_line(progress, time.monotonic() - started))
             on_progress(f"output: {output_path}")
         return RunResult(job=job, output_path=str(output_path))
     except Exception as exc:
@@ -230,36 +278,48 @@ def execute_job(
         raise EmbedForgeError(str(exc)) from exc
 
 
-def _embed_window(
-    *,
-    texts: list[str],
-    indexes: list[int],
+def _work_items(loaded: LoadedDataset, column: str) -> list[WorkItem]:
+    items: list[WorkItem] = []
+    for split in loaded.splits:
+        for index, row in enumerate(split.rows):
+            items.append((split.name, index, _as_text(row.get(column))))
+    return items
+
+
+def _is_resolved(record: EmbeddingRecord | None) -> bool:
+    if record is None:
+        return False
+    match record.status:
+        case RowStatus.SUCCESS | RowStatus.SKIPPED:
+            return True
+        case RowStatus.FAILED:
+            return False
+        case _:
+            never: Never = record.status
+            raise EmbedForgeError(f"unknown row status: {never}")
+
+
+def _pending_items(
+    items: list[WorkItem],
+    records: dict[tuple[str, int], EmbeddingRecord],
     job: Job,
     store: JobStore,
     cache: EmbeddingCache,
-    embedder: Embedder,
-    existing: dict[int, list[float] | None],
-    progress: JobProgress,
-) -> JobProgress:
-    embedded = progress.embedded
-    skipped = progress.skipped
-    failed = progress.failed
-    tokens = progress.tokens
-    cost = progress.cost_usd
-    pending: list[tuple[int, str]] = []
-    resolved: dict[int, list[float] | None] = {}
-
-    for index in indexes:
-        if index in existing:
-            skipped += 1
-            resolved[index] = existing[index]
+) -> list[WorkItem]:
+    pending: list[WorkItem] = []
+    for split, index, text in items:
+        record = records.get((split, index))
+        if _is_resolved(record):
             continue
-        text = texts[index]
         if text == "":
-            skipped += 1
-            resolved[index] = None
-            store.append_embedding(job.id, index, None, None)
-            existing[index] = None
+            store.append_embedding(job.id, index, None, None, status=RowStatus.SKIPPED, split=split)
+            records[(split, index)] = EmbeddingRecord(
+                split=split,
+                index=index,
+                status=RowStatus.SKIPPED,
+                cache_key=None,
+                embedding=None,
+            )
             continue
         cached = cache.get(
             job.embedding.provider,
@@ -268,111 +328,151 @@ def _embed_window(
             text,
         )
         if cached is not None:
-            skipped += 1
-            resolved[index] = cached
             key = _key(job, text)
-            store.append_embedding(job.id, index, key, cached)
-            existing[index] = cached
+            store.append_embedding(
+                job.id, index, key, cached, status=RowStatus.SUCCESS, split=split
+            )
+            records[(split, index)] = EmbeddingRecord(
+                split=split,
+                index=index,
+                status=RowStatus.SUCCESS,
+                cache_key=key,
+                embedding=cached,
+            )
             continue
-        pending.append((index, text))
-
-    if pending:
-        chunks = _chunk(pending, job.embedding.batch_size)
-        results = _embed_chunks(chunks, job, embedder)
-        model_info = resolve_model(
-            job.embedding.provider, job.embedding.model, job.embedding.dimensions
-        )
-        for chunk, batch, error in results:
-            if error is not None or batch is None:
-                for index, text in chunk:
-                    try:
-                        single = embedder.embed(
-                            [text],
-                            model=job.embedding.model,
-                            dimensions=job.embedding.dimensions,
-                        )
-                    except Exception:
-                        failed += 1
-                        resolved[index] = None
-                        store.append_embedding(job.id, index, None, None)
-                        existing[index] = None
-                        continue
-                    vector = single.vectors[0]
-                    tokens += single.tokens
-                    cost += estimate_cost_usd(single.tokens, model_info.usd_per_million_tokens)
-                    _store_success(job, cache, store, existing, resolved, index, text, vector)
-                    embedded += 1
-                continue
-            tokens += batch.tokens
-            cost += estimate_cost_usd(batch.tokens, model_info.usd_per_million_tokens)
-            for (index, text), vector in zip(chunk, batch.vectors, strict=True):
-                _store_success(job, cache, store, existing, resolved, index, text, vector)
-                embedded += 1
-
-    return JobProgress(
-        embedded=embedded,
-        skipped=skipped,
-        failed=failed,
-        tokens=tokens,
-        cost_usd=cost,
-        next_index=indexes[-1] + 1 if indexes else progress.next_index,
-    )
+        pending.append((split, index, text))
+    return pending
 
 
-def _store_success(
+def _dedupe_pending(pending: list[WorkItem], job: Job) -> list[tuple[str, str]]:
+    """Return unique (cache_key, text) pairs in first-seen order."""
+    seen: dict[str, str] = {}
+    ordered: list[tuple[str, str]] = []
+    for _split, _index, text in pending:
+        key = _key(job, text)
+        if key in seen:
+            continue
+        seen[key] = text
+        ordered.append((key, text))
+    return ordered
+
+
+def _rows_for_key(pending: list[WorkItem], job: Job, key: str) -> list[WorkItem]:
+    return [item for item in pending if _key(job, item[2]) == key]
+
+
+def _store_unique_success(
     job: Job,
     cache: EmbeddingCache,
     store: JobStore,
-    existing: dict[int, list[float] | None],
-    resolved: dict[int, list[float] | None],
-    index: int,
+    records: dict[tuple[str, int], EmbeddingRecord],
+    key: str,
     text: str,
     vector: list[float],
-) -> None:
-    key = cache.put(
+    pending: list[WorkItem],
+) -> int:
+    cache.put(
         job.embedding.provider,
         job.embedding.model,
         job.embedding.dimensions,
         text,
         vector,
     )
-    store.append_embedding(job.id, index, key, vector)
-    existing[index] = vector
-    resolved[index] = vector
+    written = 0
+    for split, index, _text in _rows_for_key(pending, job, key):
+        store.append_embedding(job.id, index, key, vector, status=RowStatus.SUCCESS, split=split)
+        records[(split, index)] = EmbeddingRecord(
+            split=split,
+            index=index,
+            status=RowStatus.SUCCESS,
+            cache_key=key,
+            embedding=vector,
+        )
+        written += 1
+    return written
+
+
+def _persist_group(
+    pending: list[WorkItem],
+    key: str,
+    job: Job,
+    store: JobStore,
+    records: dict[tuple[str, int], EmbeddingRecord],
+    *,
+    status: RowStatus,
+    vector: list[float] | None,
+    cache_key_value: str | None,
+) -> None:
+    for split, index, text in pending:
+        if _key(job, text) != key:
+            continue
+        store.append_embedding(job.id, index, cache_key_value, vector, status=status, split=split)
+        records[(split, index)] = EmbeddingRecord(
+            split=split,
+            index=index,
+            status=status,
+            cache_key=cache_key_value,
+            embedding=vector,
+        )
+
+
+def _progress_from_records(
+    items: list[WorkItem],
+    records: dict[tuple[str, int], EmbeddingRecord],
+    *,
+    session_embedded: int,
+    tokens: int,
+    cost_usd: float,
+) -> JobProgress:
+    success = 0
+    skipped_empty = 0
+    failed = 0
+    for split, index, _text in items:
+        record = records.get((split, index))
+        if record is None:
+            continue
+        match record.status:
+            case RowStatus.SUCCESS:
+                success += 1
+            case RowStatus.SKIPPED:
+                skipped_empty += 1
+            case RowStatus.FAILED:
+                failed += 1
+            case _:
+                never: Never = record.status
+                raise EmbedForgeError(f"unknown row status: {never}")
+    prior_or_cache = max(0, success - session_embedded)
+    return JobProgress(
+        embedded=session_embedded,
+        skipped=skipped_empty + prior_or_cache,
+        failed=failed,
+        tokens=tokens,
+        cost_usd=cost_usd,
+        next_index=success + skipped_empty,
+    )
 
 
 def _embed_chunks(
-    chunks: list[list[tuple[int, str]]],
+    chunks: list[list[str]],
     job: Job,
     embedder: Embedder,
-) -> list[tuple[list[tuple[int, str]], EmbedBatch | None, Exception | None]]:
-    if job.embedding.concurrency <= 1 or len(chunks) == 1:
-        results: list[tuple[list[tuple[int, str]], EmbedBatch | None, Exception | None]] = []
+    request_dims: int | None,
+) -> list[tuple[EmbedBatch | None, Exception | None]]:
+    if job.embedding.concurrency <= 1 or len(chunks) <= 1:
+        results: list[tuple[EmbedBatch | None, Exception | None]] = []
         for chunk in chunks:
             try:
-                batch = embedder.embed(
-                    [text for _, text in chunk],
-                    model=job.embedding.model,
-                    dimensions=job.embedding.dimensions,
-                )
-                results.append((chunk, batch, None))
+                batch = embedder.embed(chunk, model=job.embedding.model, dimensions=request_dims)
+                results.append((batch, None))
             except Exception as exc:
-                results.append((chunk, None, exc))
+                results.append((None, exc))
         return results
 
-    results_by_order: list[tuple[list[tuple[int, str]], EmbedBatch | None, Exception | None]] = [
-        (chunk, None, None) for chunk in chunks
-    ]
+    ordered: list[tuple[EmbedBatch | None, Exception | None]] = [(None, None)] * len(chunks)
 
-    def _run(
-        offset: int, chunk: list[tuple[int, str]]
-    ) -> tuple[int, EmbedBatch | None, Exception | None]:
+    def _run(offset: int, chunk: list[str]) -> tuple[int, EmbedBatch | None, Exception | None]:
         try:
-            batch = embedder.embed(
-                [text for _, text in chunk],
-                model=job.embedding.model,
-                dimensions=job.embedding.dimensions,
-            )
+            batch = embedder.embed(chunk, model=job.embedding.model, dimensions=request_dims)
             return offset, batch, None
         except Exception as exc:
             return offset, None, exc
@@ -381,28 +481,38 @@ def _embed_chunks(
         futures = [pool.submit(_run, offset, chunk) for offset, chunk in enumerate(chunks)]
         for future in as_completed(futures):
             offset, batch, error = future.result()
-            results_by_order[offset] = (chunks[offset], batch, error)
-    return results_by_order
+            ordered[offset] = (batch, error)
+    return ordered
 
 
-def _chunk(items: list[tuple[int, str]], size: int) -> list[list[tuple[int, str]]]:
+def _chunk(items: list[tuple[str, str]], size: int) -> list[list[tuple[str, str]]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+def _group_windows(
+    chunks: list[list[tuple[str, str]]], concurrency: int
+) -> list[list[list[tuple[str, str]]]]:
+    width = max(1, concurrency)
+    return [chunks[index : index + width] for index in range(0, len(chunks), width)]
 
 
 def _materialize_dataset(
     job: Job,
-    rows: list[dict[str, object]],
-    columns: tuple[str, ...],
+    loaded: LoadedDataset,
     store: JobStore,
+    records: dict[tuple[str, int], EmbeddingRecord],
 ) -> Path:
-    embeddings = store.load_embeddings(job.id)
-    table: dict[str, list[object]] = {name: [] for name in columns}
-    table[job.embedding.column] = []
-    for index, row in enumerate(rows):
-        for name in columns:
-            table[name].append(row.get(name))
-        table[job.embedding.column].append(embeddings.get(index))
-    dataset = Dataset.from_dict(table)
+    parts = DatasetDict()
+    for split in loaded.splits:
+        table: dict[str, list[object]] = {name: [] for name in split.columns}
+        table[job.embedding.column] = []
+        for index, row in enumerate(split.rows):
+            for name in split.columns:
+                table[name].append(row.get(name))
+            record = records.get((split.name, index))
+            table[job.embedding.column].append(record.embedding if record else None)
+        parts[split.name] = Dataset.from_dict(table)
+    dataset = parts
     output = store.output_dir(job.id)
     if output.exists():
         for child in sorted(output.rglob("*"), reverse=True):

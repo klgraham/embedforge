@@ -36,10 +36,29 @@ class CharStats:
 
 
 @dataclass(frozen=True)
-class LoadedDataset:
+class LoadedSplit:
+    name: str
     rows: list[dict[str, object]]
     columns: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LoadedDataset:
+    splits: tuple[LoadedSplit, ...]
     source: SourceRef
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return self.splits[0].columns if self.splits else ()
+
+    def split_names(self) -> tuple[str, ...]:
+        return tuple(item.name for item in self.splits)
+
+    def rows_for(self, name: str) -> list[dict[str, object]]:
+        for item in self.splits:
+            if item.name == name:
+                return item.rows
+        return []
 
 
 class DatasetSource(Protocol):
@@ -148,32 +167,41 @@ class HuggingFaceDatasetSource:
     def load_rows(self, request: DatasetRequest, *, limit: int | None) -> LoadedDataset:
         token = hf_token()
         report = self.inspect(request)
-        split = request.split or report.split
-        if split is None:
+        config_name = request.config or report.config
+        revision = request.revision or report.revision
+        if request.split is not None:
+            names = (request.split,)
+        elif report.splits:
+            names = tuple(report.splits)
+        elif report.split:
+            names = (report.split,)
+        else:
             raise EmbedForgeError("dataset has no splits to load")
-        dataset = load_dataset(
-            request.repository,
-            name=request.config or report.config,
-            split=split,
-            revision=request.revision or report.revision,
-            token=token,
-        )
-        if limit is not None:
-            available = len(dataset)
-            dataset = dataset.select(range(min(limit, available)))
-        columns = tuple(str(name) for name in dataset.column_names)
-        rows: list[dict[str, object]] = []
-        for row in dataset:
-            if isinstance(row, dict):
-                rows.append(dict(row))
+        loaded: list[LoadedSplit] = []
+        for split_name in names:
+            dataset = load_dataset(
+                request.repository,
+                name=config_name,
+                split=split_name,
+                revision=revision,
+                token=token,
+            )
+            if limit is not None:
+                available = len(dataset)
+                dataset = dataset.select(range(min(limit, available)))
+            columns = tuple(str(name) for name in dataset.column_names)
+            rows: list[dict[str, object]] = []
+            for row in dataset:
+                if isinstance(row, dict):
+                    rows.append(dict(row))
+            loaded.append(LoadedSplit(name=split_name, rows=rows, columns=columns))
         return LoadedDataset(
-            rows=rows,
-            columns=columns,
+            splits=tuple(loaded),
             source=SourceRef(
                 repository=request.repository,
                 revision=report.revision,
-                config=request.config or report.config,
-                split=split,
+                config=config_name,
+                split=request.split,
                 license=report.license,
             ),
         )

@@ -3,31 +3,50 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from embedforge.hfdata import CharStats, DatasetRequest, LoadedDataset
+from datasets import DatasetDict, load_from_disk
+
+from embedforge.hfdata import CharStats, DatasetRequest, LoadedDataset, LoadedSplit
 from embedforge.providers import EmbedBatch
+from embedforge.publish import DestinationInfo
 from embedforge.shapes import ColumnInfo, InspectReport, SourceRef
 
 
 @dataclass
 class FakeDatasetSource:
-    rows: Sequence[Mapping[str, object]]
+    rows: Sequence[Mapping[str, object]] = ()
     repository: str = "acme/fiqa"
     revision: str = "abc123def456"
     license: str | None = "mit"
     config: str = "default"
     split: str = "train"
+    split_data: dict[str, Sequence[Mapping[str, object]]] | None = None
     inspect_calls: int = 0
     load_calls: int = 0
 
+    def _all_splits(self) -> dict[str, list[dict[str, object]]]:
+        if self.split_data is not None:
+            return {name: [dict(row) for row in rows] for name, rows in self.split_data.items()}
+        return {self.split: [dict(row) for row in self.rows]}
+
     def inspect(self, request: DatasetRequest) -> InspectReport:
         self.inspect_calls += 1
+        splits = self._all_splits()
+        sample_rows = splits.get(request.split or self.split) or next(iter(splits.values()), [])
         columns = tuple(
             ColumnInfo(name=name, dtype="string")
-            for name in (self.rows[0].keys() if self.rows else ["text"])
+            for name in (sample_rows[0].keys() if sample_rows else ["text"])
         )
         candidates = tuple(col.name for col in columns if col.dtype == "string")
-        stats = self.character_stats(request, candidates[0] if candidates else "text")
+        stats = self.character_stats(
+            DatasetRequest(
+                repository=request.repository,
+                config=request.config,
+                split=request.split or self.split,
+            ),
+            candidates[0] if candidates else "text",
+        )
         return InspectReport(
             repository=request.repository or self.repository,
             revision=self.revision,
@@ -35,37 +54,47 @@ class FakeDatasetSource:
             config=request.config or self.config,
             split=request.split or self.split,
             configs=(self.config,),
-            splits={self.split: len(self.rows)},
+            splits={name: len(rows) for name, rows in splits.items()},
             columns=columns,
             candidate_text_columns=candidates,
-            estimated_rows=len(self.rows),
+            estimated_rows=stats.rows,
             estimated_characters=stats.estimated_characters,
         )
 
     def character_stats(self, request: DatasetRequest, column: str) -> CharStats:
+        splits = self._all_splits()
+        names = [request.split] if request.split else list(splits)
+        rows: list[dict[str, object]] = []
+        for name in names:
+            if name in splits:
+                rows.extend(splits[name])
         characters = 0
-        for row in self.rows:
+        for row in rows:
             value = row.get(column)
             characters += len(value) if isinstance(value, str) else 0
         return CharStats(
-            rows=len(self.rows),
+            rows=len(rows),
             estimated_characters=characters,
-            sampled_rows=len(self.rows),
+            sampled_rows=len(rows),
         )
 
     def load_rows(self, request: DatasetRequest, *, limit: int | None) -> LoadedDataset:
         self.load_calls += 1
-        selected = self.rows[:limit] if limit is not None else self.rows
-        rows = [dict(row) for row in selected]
-        columns = tuple(self.rows[0].keys()) if self.rows else ()
+        splits = self._all_splits()
+        names = [request.split] if request.split is not None else list(splits)
+        loaded: list[LoadedSplit] = []
+        for name in names:
+            rows = splits.get(name, [])
+            selected = rows[:limit] if limit is not None else rows
+            columns = tuple(selected[0].keys()) if selected else ()
+            loaded.append(LoadedSplit(name=name, rows=selected, columns=columns))
         return LoadedDataset(
-            rows=rows,
-            columns=columns,
+            splits=tuple(loaded),
             source=SourceRef(
                 repository=request.repository,
                 revision=self.revision,
                 config=request.config or self.config,
-                split=request.split or self.split,
+                split=request.split,
                 license=self.license,
             ),
         )
@@ -76,6 +105,8 @@ class FakeEmbedder:
     dimensions: int = 4
     calls: list[list[str]] = field(default_factory=list)
     fail_after: int | None = None
+    fail_on: set[str] = field(default_factory=set)
+    seen_dimensions: list[int | None] = field(default_factory=list)
 
     def embed(
         self,
@@ -84,8 +115,11 @@ class FakeEmbedder:
         model: str,
         dimensions: int | None,
     ) -> EmbedBatch:
+        self.seen_dimensions.append(dimensions)
         if self.fail_after is not None and len(self.calls) >= self.fail_after:
             raise RuntimeError("injected embedder failure")
+        if any(text in self.fail_on for text in texts):
+            raise RuntimeError("injected provider failure")
         self.calls.append(list(texts))
         dim = dimensions or self.dimensions
         vectors = [_vector(text, dim) for text in texts]
@@ -97,32 +131,67 @@ class FakeEmbedder:
 
 
 @dataclass
-class FakePublisher:
-    calls: list[dict[str, object]] = field(default_factory=list)
+class FakeHub:
+    """Models Hub SDK behavior: private=True does not flip an existing public repo."""
 
-    def publish(
+    repos: dict[str, dict[str, object]] = field(default_factory=dict)
+    uploads: list[dict[str, object]] = field(default_factory=list)
+
+    def inspect_destination(self, repo_id: str, token: str | None) -> DestinationInfo:
+        del token
+        if repo_id not in self.repos:
+            return DestinationInfo(exists=False, private=None)
+        private = self.repos[repo_id].get("private")
+        return DestinationInfo(exists=True, private=bool(private))
+
+    def push_dataset(
         self,
-        *,
+        dataset_dir: Path,
         repo_id: str,
+        *,
         private: bool,
         revision: str | None,
-        dataset_dir: object,
-        card: str,
-        provenance_yaml: str,
+        config_name: str | None,
         token: str | None,
-    ) -> str:
-        self.calls.append(
+    ) -> None:
+        del token
+        staged = load_from_disk(str(dataset_dir))
+        if isinstance(staged, DatasetDict):
+            split_names = list(staged.keys())
+        else:
+            split_names = []
+        if repo_id not in self.repos:
+            self.repos[repo_id] = {"private": private}
+        self.uploads.append(
             {
+                "kind": "dataset",
                 "repo_id": repo_id,
-                "private": private,
+                "private_flag": private,
                 "revision": revision,
-                "dataset_dir": str(dataset_dir),
-                "card": card,
-                "provenance_yaml": provenance_yaml,
-                "token": token,
+                "config_name": config_name,
+                "splits": split_names,
+                "actual_private": self.repos[repo_id]["private"],
             }
         )
-        return f"https://huggingface.co/datasets/{repo_id}"
+
+    def upload_text(
+        self,
+        content: str,
+        path_in_repo: str,
+        repo_id: str,
+        *,
+        revision: str | None,
+        token: str | None,
+    ) -> None:
+        del token
+        self.uploads.append(
+            {
+                "kind": path_in_repo,
+                "repo_id": repo_id,
+                "revision": revision,
+                "content": content,
+            }
+        )
 
 
 def _vector(text: str, dimensions: int) -> list[float]:
