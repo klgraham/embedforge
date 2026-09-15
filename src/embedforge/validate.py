@@ -9,7 +9,13 @@ from typing import Any
 from datasets import Dataset, DatasetDict, load_from_disk
 
 from embedforge.errors import EmbedForgeError
-from embedforge.hfdata import DatasetRequest, DatasetSource, HuggingFaceDatasetSource, LoadedDataset
+from embedforge.hfdata import (
+    DatasetRequest,
+    DatasetSource,
+    HuggingFaceDatasetSource,
+    LoadedDataset,
+    embedding_input,
+)
 from embedforge.shapes import (
     Check,
     Diagnostic,
@@ -53,7 +59,12 @@ def validate_job(
         _check_split(job, staged, loaded),
         _check_source_columns(staged, loaded.columns),
         _check_embedding_column(staged, job.embedding.column),
-        _check_dimensions(staged, job.embedding.column, job.embedding.dimensions),
+        _check_dimensions(
+            staged,
+            job.embedding.column,
+            job.embedding.dimensions,
+            job.embedding.source_columns[0],
+        ),
         _check_finite(staged, job.embedding.column),
         _check_revision(job, provenance.source.revision),
         _check_model_metadata(job, provenance),
@@ -159,7 +170,12 @@ def _vectors(staged: DatasetDict, column: str) -> list[list[float] | None]:
     return values
 
 
-def _check_dimensions(staged: DatasetDict, column: str, expected: int) -> Check:
+def _check_dimensions(
+    staged: DatasetDict,
+    column: str,
+    expected: int,
+    source_column: str,
+) -> Check:
     missing_cols = [
         name for name, dataset in _iter_splits(staged) if column not in dataset.column_names
     ]
@@ -169,16 +185,45 @@ def _check_dimensions(staged: DatasetDict, column: str, expected: int) -> Check:
             passed=False,
             message="embedding column missing",
         )
-    vectors = _vectors(staged, column)
-    dims = {len(vector) for vector in vectors if vector is not None}
-    missing = sum(1 for vector in vectors if vector is None)
-    passed = dims == {expected} and missing == 0
-    if not dims:
-        message = f"{missing} rows missing embeddings"
-    elif missing:
-        message = f"dimensions {sorted(dims)}; {missing} rows missing embeddings"
-    else:
-        message = f"dimensions {sorted(dims)}; expected {expected}"
+    missing_source_cols = [
+        name for name, dataset in _iter_splits(staged) if source_column not in dataset.column_names
+    ]
+    if missing_source_cols:
+        return Check(
+            name="uniform_dimensions",
+            passed=False,
+            message=f"source column {source_column!r} missing",
+        )
+    dims: set[int] = set()
+    empty_nulls = 0
+    missing = 0
+    malformed = 0
+    for _name, dataset in _iter_splits(staged):
+        source_values = _column(dataset, source_column)
+        embeddings = _column(dataset, column)
+        for source_value, vector in zip(source_values, embeddings, strict=True):
+            if vector is None:
+                if embedding_input(source_value) == "":
+                    empty_nulls += 1
+                else:
+                    missing += 1
+            elif isinstance(vector, list) and all(isinstance(num, (int, float)) for num in vector):
+                dims.add(len(vector))
+            else:
+                malformed += 1
+
+    wrong_dimensions = dims - {expected}
+    passed = not wrong_dimensions and missing == 0 and malformed == 0
+    parts = (
+        [f"dimensions {sorted(dims)}; expected {expected}"] if dims else ["no non-null embeddings"]
+    )
+    if empty_nulls:
+        parts.append(f"{empty_nulls} null embeddings allowed for empty {source_column!r} values")
+    if missing:
+        parts.append(f"{missing} non-empty rows missing embeddings")
+    if malformed:
+        parts.append(f"{malformed} malformed embeddings")
+    message = "; ".join(parts)
     return Check(name="uniform_dimensions", passed=passed, message=message)
 
 

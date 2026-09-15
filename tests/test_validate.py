@@ -48,6 +48,52 @@ def test_validate_accepts_complete_job(tmp_path) -> None:
     assert store.load(result.job.id).status is JobStatus.VALIDATED
 
 
+def test_validate_accepts_null_embeddings_for_empty_source_values(tmp_path) -> None:
+    result, store, source = _run_job(
+        tmp_path,
+        [{"text": ""}, {"text": None}, {"text": "embedded"}],
+    )
+
+    report = validate_job(result.job.id, store=store, source=source)
+
+    assert report.ok
+    dimensions = next(check for check in report.checks if check.name == "uniform_dimensions")
+    assert dimensions.passed
+    assert "2 null embeddings allowed for empty 'text' values" in dimensions.message
+    assert result.job.progress.skipped == 2
+
+
+def test_validate_accepts_dataset_with_only_empty_source_values(tmp_path) -> None:
+    result, store, source = _run_job(tmp_path, [{"text": ""}, {"text": None}])
+
+    report = validate_job(result.job.id, store=store, source=source)
+
+    assert report.ok
+    dimensions = next(check for check in report.checks if check.name == "uniform_dimensions")
+    assert dimensions.message.startswith("no non-null embeddings")
+
+
+def test_validate_rejects_null_embedding_for_non_empty_source_value(tmp_path) -> None:
+    source = FakeDatasetSource(rows=[{"text": "provider failure"}])
+    store = JobStore(tmp_path / "jobs")
+    result = start_or_resume(
+        "acme/fiqa",
+        column="text",
+        config=Config(batch_size=4, concurrency=1),
+        source=source,
+        store=store,
+        cache=EmbeddingCache(tmp_path / "embeddings"),
+        embedder=FakeEmbedder(fail_on={"provider failure"}),
+    )
+
+    report = validate_job(result.job.id, store=store, source=source)
+
+    assert not report.ok
+    dimensions = next(check for check in report.checks if check.name == "uniform_dimensions")
+    assert not dimensions.passed
+    assert "1 non-empty rows missing embeddings" in dimensions.message
+
+
 def test_validate_fails_when_license_missing(tmp_path) -> None:
     source = FakeDatasetSource(rows=[{"text": "only"}], license=None)
     store = JobStore(tmp_path / "jobs")
