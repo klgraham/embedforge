@@ -229,9 +229,7 @@ def test_repeated_appends_parse_journal_once(tmp_path, monkeypatch) -> None:
             '{"split":"train","index":0,"status":"success","cache_key":"k","embedding":[1.0]}\n'
         )
         for index in range(1, count + 1):
-            store.append_embedding(
-                job_id, index, "k", status=RowStatus.SUCCESS, split="train"
-            )
+            store.append_embedding(job_id, index, "k", status=RowStatus.SUCCESS, split="train")
         store.close_journal(job_id)
         return parses["n"]
 

@@ -91,10 +91,14 @@ class EmbeddingCache:
     def get_by_key(self, key: str, *, dimensions: int | None = None) -> list[float] | None:
         if not self.database_path.exists() and self._connection is None:
             return None
-        row = self._connect().execute(
-            "SELECT dimensions, embedding FROM embeddings WHERE key = ?",
-            (key,),
-        ).fetchone()
+        row = (
+            self._connect()
+            .execute(
+                "SELECT dimensions, embedding FROM embeddings WHERE key = ?",
+                (key,),
+            )
+            .fetchone()
+        )
         if row is None:
             return None
         stored_dimensions = int(row[0])
@@ -315,9 +319,7 @@ class EmbeddingCache:
 
 def _encode_embedding(embedding: list[float], dimensions: int) -> bytes:
     if len(embedding) != dimensions:
-        raise EmbedForgeError(
-            f"embedding has {len(embedding)} dimensions; expected {dimensions}"
-        )
+        raise EmbedForgeError(f"embedding has {len(embedding)} dimensions; expected {dimensions}")
     try:
         values = array("f", (float(value) for value in embedding))
     except (OverflowError, TypeError, ValueError) as exc:
@@ -330,9 +332,7 @@ def _encode_embedding(embedding: list[float], dimensions: int) -> bytes:
 def _decode_embedding(payload: bytes, dimensions: int) -> list[float]:
     expected = dimensions * 4
     if len(payload) != expected:
-        raise EmbedForgeError(
-            f"cache embedding contains {len(payload)} bytes; expected {expected}"
-        )
+        raise EmbedForgeError(f"cache embedding contains {len(payload)} bytes; expected {expected}")
     values = array("f")
     values.frombytes(payload)
     if sys.byteorder != "little":
@@ -367,9 +367,7 @@ def _load_legacy(path: Path, *, strict: bool) -> _LegacyEntry | None:
             raise ValueError("file name does not match cache key")
         vector = [float(value) for value in embedding]
         if len(vector) != dimensions:
-            raise ValueError(
-                f"embedding has {len(vector)} dimensions; expected {dimensions}"
-            )
+            raise ValueError(f"embedding has {len(vector)} dimensions; expected {dimensions}")
         return _LegacyEntry(
             metadata=CacheEntry(
                 key=key,

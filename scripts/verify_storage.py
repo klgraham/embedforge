@@ -59,9 +59,7 @@ def main() -> None:
         for dtype in ("float32", "float16"):
             dataset = Dataset.from_dict(
                 {"embedding": vectors},
-                features=Features(
-                    {"embedding": Sequence(Value(dtype), length=dimensions)}
-                ),
+                features=Features({"embedding": Sequence(Value(dtype), length=dimensions)}),
             )
             path = root / f"{dtype}.parquet"
             dataset.to_parquet(path)

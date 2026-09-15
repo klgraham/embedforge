@@ -366,9 +366,7 @@ def _pending_items(
         )
         if cached is not None:
             key = _key(job, text)
-            store.append_embedding(
-                job.id, index, key, status=RowStatus.SUCCESS, split=split
-            )
+            store.append_embedding(job.id, index, key, status=RowStatus.SUCCESS, split=split)
             records[(split, index)] = EmbeddingRecord(
                 split=split,
                 index=index,
