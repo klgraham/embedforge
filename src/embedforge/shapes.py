@@ -18,6 +18,7 @@ ALLOWED_CONFIG_KEYS = (
     "concurrency",
     "dimensions",
     "output_column",
+    "storage_dtype",
     "hf_namespace",
 )
 
@@ -26,6 +27,7 @@ DEFAULT_MODEL = "text-embedding-3-small"
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_CONCURRENCY = 8
 DEFAULT_OUTPUT_COLUMN = "embedding"
+DEFAULT_STORAGE_DTYPE = "float32"
 
 
 class Provider(StrEnum):
@@ -48,6 +50,11 @@ class RowStatus(StrEnum):
     FAILED = "failed"
 
 
+class StorageDType(StrEnum):
+    FLOAT32 = "float32"
+    FLOAT16 = "float16"
+
+
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -61,6 +68,17 @@ def parse_provider(value: str) -> Provider:
     raise EmbedForgeError(f"unknown provider {value!r}; expected one of: {allowed}")
 
 
+def parse_storage_dtype(value: str) -> StorageDType:
+    normalized = value.strip().lower()
+    try:
+        return StorageDType(normalized)
+    except ValueError:
+        allowed = ", ".join(dtype.value for dtype in StorageDType)
+        raise EmbedForgeError(
+            f"unknown storage dtype {value!r}; expected one of: {allowed}"
+        ) from None
+
+
 @dataclass(frozen=True)
 class Config:
     """Resolved user settings. Secrets are never stored here."""
@@ -71,6 +89,7 @@ class Config:
     concurrency: int = DEFAULT_CONCURRENCY
     dimensions: int | None = None
     output_column: str = DEFAULT_OUTPUT_COLUMN
+    storage_dtype: str = DEFAULT_STORAGE_DTYPE
     hf_namespace: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,6 +100,7 @@ class Config:
             "concurrency": self.concurrency,
             "dimensions": self.dimensions,
             "output_column": self.output_column,
+            "storage_dtype": self.storage_dtype,
             "hf_namespace": self.hf_namespace,
         }
 
@@ -122,6 +142,7 @@ class EmbeddingSettings:
     source_columns: tuple[str, ...]
     batch_size: int
     concurrency: int
+    storage_dtype: str = DEFAULT_STORAGE_DTYPE
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,6 +153,7 @@ class EmbeddingSettings:
             "source_columns": list(self.source_columns),
             "batch_size": self.batch_size,
             "concurrency": self.concurrency,
+            "storage_dtype": self.storage_dtype,
         }
 
     @staticmethod
@@ -149,6 +171,9 @@ class EmbeddingSettings:
             source_columns=tuple(raw_columns),
             batch_size=_require_int(data, "batch_size"),
             concurrency=_require_int(data, "concurrency"),
+            storage_dtype=parse_storage_dtype(
+                _optional_str(data.get("storage_dtype")) or DEFAULT_STORAGE_DTYPE
+            ).value,
         )
 
 
@@ -369,6 +394,7 @@ class Provenance:
                 "dimensions": self.embedding.dimensions,
                 "column": self.embedding.column,
                 "source_columns": list(self.embedding.source_columns),
+                "storage_dtype": self.embedding.storage_dtype,
                 "created_at": self.created_at,
             },
         }
@@ -394,6 +420,9 @@ class Provenance:
             source_columns=tuple(source_columns),
             batch_size=1,
             concurrency=1,
+            storage_dtype=parse_storage_dtype(
+                _optional_str(embedding_raw.get("storage_dtype")) or DEFAULT_STORAGE_DTYPE
+            ).value,
         )
         return Provenance(
             embedforge_version=_require_str(embedforge, "version"),

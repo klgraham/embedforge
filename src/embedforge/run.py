@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Never
 
-from datasets import Dataset, DatasetDict
+from datasets import Dataset, DatasetDict, Features, Sequence, Value
 
 from embedforge import __version__
 from embedforge.cache import EmbeddingCache, cache_key
@@ -62,6 +62,7 @@ def start_or_resume(
     output_column: str | None = None,
     batch_size: int | None = None,
     concurrency: int | None = None,
+    storage_dtype: str | None = None,
     limit: int | None = None,
     source: DatasetSource | None = None,
     store: JobStore | None = None,
@@ -81,6 +82,7 @@ def start_or_resume(
         output_column=output_column,
         batch_size=batch_size,
         concurrency=concurrency,
+        storage_dtype=storage_dtype,
     )
     if resume_id:
         job = job_store.load(resume_id)
@@ -225,7 +227,6 @@ def execute_job(
                                 store,
                                 records,
                                 status=RowStatus.FAILED,
-                                vector=None,
                                 cache_key_value=None,
                             )
                             continue
@@ -274,7 +275,7 @@ def execute_job(
             tokens=tokens,
             cost_usd=cost,
         )
-        output_path = _materialize_dataset(job, loaded, store, records)
+        output_path = _materialize_dataset(job, loaded, store, records, cache)
         status = JobStatus.COMPLETED if progress.failed == 0 else JobStatus.FAILED
         job = replace_job(
             job,
@@ -328,10 +329,27 @@ def _pending_items(
     pending: list[WorkItem] = []
     for split, index, text in items:
         record = records.get((split, index))
-        if _is_resolved(record):
+        if record is not None and record.status is RowStatus.SUCCESS:
+            if record.embedding is not None:
+                continue
+            cached_record = (
+                cache.get_by_key(record.cache_key, dimensions=job.embedding.dimensions)
+                if record.cache_key is not None
+                else None
+            )
+            if cached_record is not None:
+                records[(split, index)] = EmbeddingRecord(
+                    split=split,
+                    index=index,
+                    status=RowStatus.SUCCESS,
+                    cache_key=record.cache_key,
+                    embedding=cached_record,
+                )
+                continue
+        elif _is_resolved(record):
             continue
         if text == "":
-            store.append_embedding(job.id, index, None, None, status=RowStatus.SKIPPED, split=split)
+            store.append_embedding(job.id, index, None, status=RowStatus.SKIPPED, split=split)
             records[(split, index)] = EmbeddingRecord(
                 split=split,
                 index=index,
@@ -349,7 +367,7 @@ def _pending_items(
         if cached is not None:
             key = _key(job, text)
             store.append_embedding(
-                job.id, index, key, cached, status=RowStatus.SUCCESS, split=split
+                job.id, index, key, status=RowStatus.SUCCESS, split=split
             )
             records[(split, index)] = EmbeddingRecord(
                 split=split,
@@ -401,14 +419,17 @@ def _store_unique_success(
         text,
         vector,
     )
+    stored = cache.get_by_key(key, dimensions=job.embedding.dimensions)
+    if stored is None:
+        raise EmbedForgeError(f"cache did not retain embedding {key}")
     for split, index, _text in rows:
-        store.append_embedding(job.id, index, key, vector, status=RowStatus.SUCCESS, split=split)
+        store.append_embedding(job.id, index, key, status=RowStatus.SUCCESS, split=split)
         records[(split, index)] = EmbeddingRecord(
             split=split,
             index=index,
             status=RowStatus.SUCCESS,
             cache_key=key,
-            embedding=vector,
+            embedding=stored,
         )
     return len(rows)
 
@@ -420,17 +441,16 @@ def _persist_group(
     records: dict[tuple[str, int], EmbeddingRecord],
     *,
     status: RowStatus,
-    vector: list[float] | None,
     cache_key_value: str | None,
 ) -> None:
     for split, index, _text in rows:
-        store.append_embedding(job.id, index, cache_key_value, vector, status=status, split=split)
+        store.append_embedding(job.id, index, cache_key_value, status=status, split=split)
         records[(split, index)] = EmbeddingRecord(
             split=split,
             index=index,
             status=status,
             cache_key=cache_key_value,
-            embedding=vector,
+            embedding=None,
         )
 
 
@@ -519,17 +539,35 @@ def _materialize_dataset(
     loaded: LoadedDataset,
     store: JobStore,
     records: dict[tuple[str, int], EmbeddingRecord],
+    cache: EmbeddingCache,
 ) -> Path:
     parts = DatasetDict()
     for split in loaded.splits:
         table: dict[str, list[object]] = {name: [] for name in split.columns}
-        table[job.embedding.column] = []
+        vectors: list[object] = []
         for index, row in enumerate(split.rows):
             for name in split.columns:
                 table[name].append(row.get(name))
             record = records.get((split.name, index))
-            table[job.embedding.column].append(record.embedding if record else None)
-        parts[split.name] = Dataset.from_dict(table)
+            vector = record.embedding if record else None
+            if vector is None and record is not None and record.cache_key is not None:
+                vector = cache.get_by_key(
+                    record.cache_key,
+                    dimensions=job.embedding.dimensions,
+                )
+            vectors.append(vector)
+        source_dataset = Dataset.from_dict(table)
+        features = Features(
+            {
+                **source_dataset.features,
+                job.embedding.column: Sequence(
+                    Value(job.embedding.storage_dtype),
+                    length=job.embedding.dimensions,
+                ),
+            }
+        )
+        table[job.embedding.column] = vectors
+        parts[split.name] = Dataset.from_dict(table, features=features)
     dataset = parts
     output = store.output_dir(job.id)
     if output.exists():
@@ -569,6 +607,7 @@ def _plan_with_batch(plan: Plan, batch_size: int, concurrency: int) -> Plan:
         source_columns=embedding.source_columns,
         batch_size=batch_size,
         concurrency=concurrency,
+        storage_dtype=embedding.storage_dtype,
     )
     return Plan(
         source=plan.source,

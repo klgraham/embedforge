@@ -33,6 +33,7 @@ from embedforge.shapes import (
     PublishResult,
     ValidationResult,
 )
+from embedforge.storage import migrate_storage
 from embedforge.store import JobStore
 from embedforge.validate import validate_job
 
@@ -131,6 +132,20 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     cache_clean = cache_sub.add_parser("clean", help="delete cached embeddings")
     cache_clean.set_defaults(handler=cmd_cache_clean)
 
+    p_storage = sub.add_parser("storage", help="manage local embedding storage")
+    p_storage.set_defaults(handler=cmd_storage_help, storage_cmd=None)
+    storage_sub = p_storage.add_subparsers(dest="storage_cmd")
+    storage_migrate = storage_sub.add_parser(
+        "migrate",
+        help="pack legacy JSON caches and job journals",
+    )
+    storage_migrate.add_argument(
+        "--delete-legacy-cache",
+        action="store_true",
+        help="delete JSON cache files after their SQLite copies commit",
+    )
+    storage_migrate.set_defaults(handler=cmd_storage_migrate)
+
     return parser.parse_args(list(argv))
 
 
@@ -141,6 +156,7 @@ def _add_job_flags(parser: argparse.ArgumentParser, *, require_dataset: bool) ->
     parser.add_argument("--provider")
     parser.add_argument("--model")
     parser.add_argument("--dimensions", type=int)
+    parser.add_argument("--storage-dtype", choices=("float32", "float16"))
     parser.add_argument("--config")
     parser.add_argument("--split")
     parser.add_argument("--batch-size", type=int)
@@ -189,6 +205,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print(f"Concurrency:     {config.concurrency}")
     print(f"Dimensions:      {config.dimensions if config.dimensions else 'model default'}")
     print(f"Output column:   {config.output_column}")
+    print(f"Storage dtype:   {config.storage_dtype}")
     print(f"HF namespace:    {config.hf_namespace or 'not set'}")
     print()
     print(f"OPENAI_API_KEY:  {format_secret_status(secrets['OPENAI_API_KEY'])}")
@@ -243,6 +260,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
         provider=args.provider,
         model=args.model,
         dimensions=args.dimensions,
+        storage_dtype=args.storage_dtype,
         output_column=args.output_column,
         batch_size=args.batch_size,
         concurrency=args.concurrency,
@@ -276,6 +294,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         provider=args.provider,
         model=args.model,
         dimensions=args.dimensions,
+        storage_dtype=args.storage_dtype,
         output_column=args.output_column,
         batch_size=args.batch_size,
         concurrency=args.concurrency,
@@ -369,7 +388,9 @@ def cmd_cache_help(args: argparse.Namespace) -> int:
 def cmd_cache_info(args: argparse.Namespace) -> int:
     info = EmbeddingCache().info()
     print(f"Path:    {info['path']}")
+    print(f"Database: {info['database']}")
     print(f"Entries: {info['entries']}")
+    print(f"Legacy:  {info['legacy_entries']}")
     print(f"Size:    {_format_bytes(int(info['bytes']))}")
     return 0
 
@@ -389,6 +410,27 @@ def cmd_cache_clean(args: argparse.Namespace) -> int:
     removed = EmbeddingCache().clean()
     print(f"removed {removed} cached embeddings")
     print("note: embed cache gc is planned for a later release")
+    return 0
+
+
+def cmd_storage_help(args: argparse.Namespace) -> int:
+    raise EmbedForgeError("usage: embed storage migrate [--delete-legacy-cache]")
+
+
+def cmd_storage_migrate(args: argparse.Namespace) -> int:
+    result = migrate_storage(delete_legacy_cache=bool(args.delete_legacy_cache))
+    cache = result.cache
+    print(
+        "cache: "
+        f"scanned={cache.scanned} imported={cache.imported} "
+        f"existing={cache.existing} deleted={cache.deleted}"
+    )
+    print(
+        "journals: "
+        f"count={len(result.journals)} "
+        f"before={_format_bytes(result.bytes_before)} "
+        f"after={_format_bytes(result.bytes_after)}"
+    )
     return 0
 
 
@@ -431,6 +473,7 @@ def _format_plan(plan: Plan) -> str:
             f"  Provider:    {embedding.provider}",
             f"  Model:       {embedding.model}",
             f"  Dimensions:  {embedding.dimensions}",
+            f"  Storage:     {embedding.storage_dtype}",
             f"  Batch size:  {embedding.batch_size}",
             f"  Concurrency: {embedding.concurrency}",
             "",
@@ -466,6 +509,7 @@ def _format_job(job: Job, store: JobStore) -> str:
             f"Revision:     {job.source.revision}",
             f"Model:        {job.embedding.model}",
             f"Provider:     {job.embedding.provider}",
+            f"Storage:      {job.embedding.storage_dtype}",
             f"Progress:     next={progress.next_index}",
             f"Embedded:     {progress.embedded}",
             f"Skipped:      {progress.skipped}",

@@ -17,8 +17,10 @@ from embedforge.shapes import (
     DEFAULT_MODEL,
     DEFAULT_OUTPUT_COLUMN,
     DEFAULT_PROVIDER,
+    DEFAULT_STORAGE_DTYPE,
     Config,
     parse_provider,
+    parse_storage_dtype,
 )
 
 _SECRET_ENV_BY_KEY = {
@@ -103,6 +105,9 @@ def resolve_config(stored: dict[str, Any]) -> Config:
         concurrency=_as_positive_int(stored.get("concurrency", DEFAULT_CONCURRENCY), "concurrency"),
         dimensions=_optional_positive_int(stored.get("dimensions"), "dimensions"),
         output_column=output_column,
+        storage_dtype=parse_storage_dtype(
+            _string_value(stored.get("storage_dtype", DEFAULT_STORAGE_DTYPE), "storage_dtype")
+        ).value,
         hf_namespace=namespace or None,
     )
 
@@ -159,6 +164,8 @@ def parse_config_value(key: str, raw: str) -> str | int:
         return _as_positive_int(raw, key)
     if key == "provider":
         return parse_provider(raw).value
+    if key == "storage_dtype":
+        return parse_storage_dtype(raw).value
     if not raw.strip():
         raise EmbedForgeError(f"{key} must be a non-empty string")
     return raw.strip()
@@ -173,6 +180,7 @@ def apply_overrides(
     output_column: str | None = None,
     batch_size: int | None = None,
     concurrency: int | None = None,
+    storage_dtype: str | None = None,
     hf_namespace: str | None = None,
 ) -> Config:
     updated = config
@@ -188,6 +196,8 @@ def apply_overrides(
         updated = replace(updated, batch_size=_as_positive_int(batch_size, "batch_size"))
     if concurrency is not None:
         updated = replace(updated, concurrency=_as_positive_int(concurrency, "concurrency"))
+    if storage_dtype is not None:
+        updated = replace(updated, storage_dtype=parse_storage_dtype(storage_dtype).value)
     if hf_namespace is not None:
         updated = replace(updated, hf_namespace=hf_namespace)
     return updated
@@ -265,6 +275,12 @@ def _optional_positive_int(value: object, key: str) -> int | None:
     if value is None:
         return None
     return _as_positive_int(value, key)
+
+
+def _string_value(value: object, key: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise EmbedForgeError(f"{key} must be a non-empty string")
+    return value
 
 
 def format_secret_status(available: bool) -> str:

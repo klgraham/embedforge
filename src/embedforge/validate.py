@@ -260,11 +260,12 @@ def _check_model_metadata(job: Job, provenance: Provenance) -> Check:
         embedding.provider == job.embedding.provider
         and embedding.model == job.embedding.model
         and embedding.dimensions == job.embedding.dimensions
+        and embedding.storage_dtype == job.embedding.storage_dtype
     )
     return Check(
         name="model_metadata",
         passed=bool(passed),
-        message="provider, model, and dimensions recorded"
+        message="provider, model, dimensions, and storage dtype recorded"
         if passed
         else "embedding metadata missing or mismatched",
     )

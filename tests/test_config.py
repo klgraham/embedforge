@@ -41,9 +41,12 @@ def test_set_get_unset_reset_roundtrip(isolated_home, capsys) -> None:
     assert main(["set", "provider", "openrouter"]) == 0
     assert main(["set", "model", "text-embedding-3-large"]) == 0
     assert main(["set", "batch_size", "16"]) == 0
+    assert main(["set", "storage_dtype", "float16"]) == 0
     capsys.readouterr()
     assert main(["get", "provider"]) == 0
     assert capsys.readouterr().out.strip() == "openrouter"
+    assert main(["get", "storage_dtype"]) == 0
+    assert capsys.readouterr().out.strip() == "float16"
     assert main(["unset", "model"]) == 0
     capsys.readouterr()
     assert main(["get", "model"]) == 0
