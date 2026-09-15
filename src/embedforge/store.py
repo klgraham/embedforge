@@ -7,11 +7,14 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 
 from embedforge.errors import EmbedForgeError
 from embedforge.paths import job_dir, jobs_dir
 from embedforge.shapes import Job, Plan, Provenance, RowStatus, utc_now
+
+if TYPE_CHECKING:
+    from embedforge.cache import EmbeddingCache
 
 _ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -47,6 +50,13 @@ class EmbeddingRecord:
     status: RowStatus
     cache_key: str | None
     embedding: list[float] | None
+
+
+@dataclass(frozen=True)
+class JournalCompaction:
+    records: int
+    bytes_before: int
+    bytes_after: int
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -113,11 +123,7 @@ class JobStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         loaded: dict[tuple[str, int], EmbeddingRecord] = {}
         if path.exists():
-            text = path.read_text(encoding="utf-8")
-            complete, loaded, torn = _parse_journal(job_id, text)
-            normalized = "".join(f"{line}\n" for line in complete)
-            if torn or text != normalized:
-                write_text_atomic(path, normalized)
+            loaded = _read_journal(job_id, path, repair=True)
         else:
             path.touch()
         self._writers[job_id] = path.open("a", encoding="utf-8")
@@ -133,17 +139,17 @@ class JobStore:
         job_id: str,
         index: int,
         key: str | None,
-        vector: list[float] | None,
         *,
         status: RowStatus,
         split: str,
     ) -> None:
+        if status is RowStatus.SUCCESS and key is None:
+            raise EmbedForgeError("successful journal records require a cache key")
         record = {
             "split": split,
             "index": index,
             "status": status.value,
             "cache_key": key,
-            "embedding": vector,
         }
         handle = self._writers.get(job_id)
         if handle is None:
@@ -159,14 +165,103 @@ class JobStore:
         path = self.embeddings_path(job_id)
         if not path.exists():
             return {}
-        _complete, loaded, _torn = _parse_journal(job_id, path.read_text(encoding="utf-8"))
-        return loaded
+        return _read_journal(job_id, path, repair=False)
 
     def load_embeddings(self, job_id: str) -> dict[int, list[float] | None]:
         loaded: dict[int, list[float] | None] = {}
         for (_split, index), record in self.load_records(job_id).items():
             loaded[index] = record.embedding
         return loaded
+
+    def compact_journal(
+        self,
+        job_id: str,
+        cache: EmbeddingCache,
+    ) -> JournalCompaction:
+        """Move legacy journal vectors into the cache and keep key references."""
+        self.close_journal(job_id)
+        job = self.load(job_id)
+        path = self.embeddings_path(job_id)
+        before = path.stat().st_size if path.exists() else 0
+        tmp = path.with_name(path.name + ".compact.tmp")
+        count = 0
+        try:
+            with path.open("rb") as source, tmp.open("w", encoding="utf-8") as destination:
+                for raw_line in source:
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        raw = _journal_loads(raw_line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        if not raw_line.endswith(b"\n"):
+                            break
+                        raise EmbedForgeError(
+                            f"corrupt embeddings journal in job {job_id}"
+                        ) from None
+                    record = _record_from_raw(raw)
+                    if record is None:
+                        continue
+                    if record.status is RowStatus.SUCCESS:
+                        if record.cache_key is None:
+                            raise EmbedForgeError(
+                                f"cannot compact successful row "
+                                f"{record.split}/{record.index} without a cache key"
+                            )
+                        cached = cache.get_by_key(
+                            record.cache_key,
+                            dimensions=job.embedding.dimensions,
+                        )
+                        if (
+                            cached is not None
+                            and record.embedding is not None
+                            and not cache.matches(
+                                record.cache_key,
+                                dimensions=job.embedding.dimensions,
+                                embedding=record.embedding,
+                            )
+                        ):
+                            raise EmbedForgeError(
+                                f"cannot compact row {record.split}/{record.index}; "
+                                "journal and cache embeddings differ"
+                            )
+                        if cached is None:
+                            if record.embedding is None:
+                                raise EmbedForgeError(
+                                    f"cannot compact row {record.split}/{record.index}; "
+                                    "cached embedding is missing"
+                                )
+                            cache.put_by_key(
+                                record.cache_key,
+                                provider=job.embedding.provider,
+                                model=job.embedding.model,
+                                dimensions=job.embedding.dimensions,
+                                embedding=record.embedding,
+                                created_at=job.created_at,
+                            )
+                    destination.write(
+                        json.dumps(
+                            {
+                                "split": record.split,
+                                "index": record.index,
+                                "status": record.status.value,
+                                "cache_key": record.cache_key,
+                            },
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+                    count += 1
+                destination.flush()
+                os.fsync(destination.fileno())
+            tmp.replace(path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        return JournalCompaction(
+            records=count,
+            bytes_before=before,
+            bytes_after=path.stat().st_size,
+        )
 
     def list_jobs(self) -> list[Job]:
         if not self.root.exists():
@@ -203,6 +298,38 @@ class JobStore:
 
 def _journal_loads(line: str) -> Any:
     return json.loads(line)
+
+
+def _read_journal(
+    job_id: str,
+    path: Path,
+    *,
+    repair: bool,
+) -> dict[tuple[str, int], EmbeddingRecord]:
+    loaded: dict[tuple[str, int], EmbeddingRecord] = {}
+    complete_bytes = 0
+    torn = False
+    with path.open("rb") as handle:
+        for raw_line in handle:
+            if not raw_line.strip():
+                complete_bytes += len(raw_line)
+                continue
+            try:
+                line = raw_line.decode("utf-8")
+                raw = _journal_loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                if not raw_line.endswith(b"\n"):
+                    torn = True
+                    break
+                raise EmbedForgeError(f"corrupt embeddings journal in job {job_id}") from None
+            complete_bytes += len(raw_line)
+            record = _record_from_raw(raw)
+            if record is not None:
+                loaded[(record.split, record.index)] = record
+    if torn and repair:
+        with path.open("r+b") as handle:
+            handle.truncate(complete_bytes)
+    return loaded
 
 
 def _parse_journal(

@@ -135,8 +135,8 @@ def test_resume_repairs_torn_journal_and_finishes_remaining_work(tmp_path) -> No
     assert set(records) == {("train", 0), ("train", 1), ("train", 2)}
     assert all(record.status is RowStatus.SUCCESS for record in records.values())
     retried = [text for batch in embedder.calls[calls_before:] for text in batch]
-    assert set(retried) == {"row-1", "row-2"}
-    store.append_embedding(first.job.id, 99, "x", [0.0], status=RowStatus.SUCCESS, split="train")
+    assert set(retried) == {"row-0", "row-1", "row-2"}
+    store.append_embedding(first.job.id, 99, "x", status=RowStatus.SUCCESS, split="train")
     assert ("train", 99) in store.load_records(first.job.id)
 
 

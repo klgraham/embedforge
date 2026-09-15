@@ -34,6 +34,9 @@ def test_selected_split_is_preserved_on_disk(tmp_path) -> None:
     assert isinstance(staged, DatasetDict)
     assert list(staged.keys()) == ["test"]
     assert len(staged["test"]) == 2
+    embedding_feature = staged["test"].features["embedding"]
+    assert embedding_feature.length == result.job.embedding.dimensions
+    assert embedding_feature.feature.dtype == "float32"
     assert result.job.source.split == "test"
     assert result.job.source.config == "default"
     report = validate_job(result.job.id, store=store, source=source)
@@ -74,3 +77,26 @@ def test_all_splits_are_transformed_when_split_omitted(tmp_path) -> None:
     assert set(raw_splits) == {"train", "test"}
     assert dataset["config_name"] == "default"
     assert published.private is True
+
+
+def test_float16_storage_is_explicit_and_fixed_width(tmp_path) -> None:
+    source = FakeDatasetSource(rows=[{"text": "one"}, {"text": "two"}])
+    store = JobStore(tmp_path / "jobs")
+
+    result = start_or_resume(
+        "acme/fiqa",
+        column="text",
+        config=Config(batch_size=8, concurrency=1, storage_dtype="float16"),
+        source=source,
+        store=store,
+        cache=EmbeddingCache(tmp_path / "embeddings"),
+        embedder=FakeEmbedder(),
+    )
+
+    staged = load_from_disk(str(result.output_path))
+    assert isinstance(staged, DatasetDict)
+    embedding_feature = staged["train"].features["embedding"]
+    assert embedding_feature.length == result.job.embedding.dimensions
+    assert embedding_feature.feature.dtype == "float16"
+    assert result.job.embedding.storage_dtype == "float16"
+    assert store.load_provenance(result.job.id).embedding.storage_dtype == "float16"

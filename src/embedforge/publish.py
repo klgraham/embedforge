@@ -286,6 +286,7 @@ def build_dataset_card(job: Job, provenance_yaml: str) -> str:
         f"- Provider: `{embedding.provider}`\n"
         f"- Model: `{embedding.model}`\n"
         f"- Dimensions: `{embedding.dimensions}`\n"
+        f"- Storage dtype: `{embedding.storage_dtype}`\n"
         f"- Source column(s): {', '.join(f'`{name}`' for name in embedding.source_columns)}\n"
         f"- Output column: `{embedding.column}`\n\n"
         f"## Provenance\n\n"

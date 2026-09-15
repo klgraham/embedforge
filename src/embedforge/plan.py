@@ -17,6 +17,7 @@ from embedforge.shapes import (
     OutputSpec,
     Plan,
     SourceRef,
+    parse_storage_dtype,
     utc_now,
 )
 
@@ -109,6 +110,7 @@ def build_plan(
         source_columns=(column,),
         batch_size=resolved.batch_size,
         concurrency=resolved.concurrency,
+        storage_dtype=parse_storage_dtype(resolved.storage_dtype).value,
     )
     output = OutputSpec(
         repo=default_output_repo(

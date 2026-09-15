@@ -4,7 +4,7 @@ import embedforge.plan as plan_mod
 import embedforge.providers as providers_mod
 from embedforge.errors import EmbedForgeError
 from embedforge.plan import build_plan, default_output_repo
-from embedforge.shapes import Config
+from embedforge.shapes import Config, Plan
 from tests.fakes import FakeDatasetSource, FakeEmbedder
 
 
@@ -30,6 +30,7 @@ def test_plan_does_not_call_embedding_provider(monkeypatch) -> None:
     assert plan.embedding.provider == "openai"
     assert plan.embedding.model == "text-embedding-3-small"
     assert plan.embedding.dimensions == 1536
+    assert plan.embedding.storage_dtype == "float32"
     assert plan.output.repo == "klogram/fiqa-openai-text-embedding-3-small-1536"
     assert plan.output.column == "embedding"
     assert plan.estimates.rows == 2
@@ -80,3 +81,40 @@ def test_plan_output_repo_uses_requested_dimensions() -> None:
     )
     assert plan.embedding.dimensions == 512
     assert plan.output.repo == "fiqa-openai-text-embedding-3-small-512"
+
+
+def test_plan_records_float16_storage_without_changing_embedding_dimensions() -> None:
+    source = FakeDatasetSource(rows=[{"text": "hello"}])
+    plan = build_plan(
+        "acme/fiqa",
+        column="text",
+        config=Config(storage_dtype="float16"),
+        source=source,
+    )
+    assert plan.embedding.storage_dtype == "float16"
+    assert plan.embedding.dimensions == 1536
+
+
+def test_legacy_plan_without_storage_dtype_defaults_to_float32() -> None:
+    source = FakeDatasetSource(rows=[{"text": "hello"}])
+    raw = build_plan("acme/fiqa", column="text", source=source).to_dict()
+    raw["embedding"].pop("storage_dtype")
+
+    restored = Plan.from_dict(raw)
+
+    assert restored.embedding.storage_dtype == "float32"
+
+
+def test_plan_rejects_unknown_storage_dtype() -> None:
+    source = FakeDatasetSource(rows=[{"text": "hello"}])
+    try:
+        build_plan(
+            "acme/fiqa",
+            column="text",
+            config=Config(storage_dtype="float64"),
+            source=source,
+        )
+    except EmbedForgeError as exc:
+        assert "unknown storage dtype" in str(exc)
+    else:
+        raise AssertionError("expected unknown storage dtype to fail")

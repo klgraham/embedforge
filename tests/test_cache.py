@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import sqlite3
+
+import pytest
+
 import embedforge.store as store_mod
 from embedforge.cache import EmbeddingCache, cache_key
 from embedforge.errors import EmbedForgeError
@@ -55,11 +60,17 @@ def test_cache_put_get_roundtrip(tmp_path) -> None:
     cache = EmbeddingCache(tmp_path / "embeddings")
     vector = [0.1, 0.2, 0.3]
     key = cache.put("openai", "text-embedding-3-small", 3, "hello", vector)
-    assert cache.get("openai", "text-embedding-3-small", 3, "hello") == vector
+    assert cache.get("openai", "text-embedding-3-small", 3, "hello") == pytest.approx(vector)
     assert key == cache_key("openai", "text-embedding-3-small", 3, "hello")
     assert cache.get("openai", "text-embedding-3-small", 3, "goodbye") is None
     info = cache.info()
     assert info["entries"] == 1
+    assert info["legacy_entries"] == 0
+    with sqlite3.connect(cache.database_path) as connection:
+        stored_bytes = connection.execute(
+            "SELECT length(embedding) FROM embeddings WHERE key = ?", (key,)
+        ).fetchone()
+    assert stored_bytes == (12,)
     assert cache.clean() == 1
     assert cache.list_entries() == []
 
@@ -89,15 +100,91 @@ def test_append_truncates_torn_journal_before_write(tmp_path) -> None:
         '{"index":'
     )
     store.load_records(job_id)
-    store.append_embedding(job_id, 1, "k", [2.0], status=RowStatus.SUCCESS, split="train")
+    store.append_embedding(job_id, 1, "k", status=RowStatus.SUCCESS, split="train")
     records = store.load_records(job_id)
     assert set(records) == {("train", 0), ("train", 1)}
-    assert records[("train", 1)].embedding == [2.0]
-    store.append_embedding(job_id, 2, "k", [3.0], status=RowStatus.SUCCESS, split="train")
+    assert records[("train", 1)].embedding is None
+    store.append_embedding(job_id, 2, "k", status=RowStatus.SUCCESS, split="train")
     records = store.load_records(job_id)
     assert set(records) == {("train", 0), ("train", 1), ("train", 2)}
     text = path.read_text()
     assert '{"index":{' not in text
+    assert '"embedding"' not in text.splitlines()[-1]
+
+
+def test_legacy_json_cache_migrates_to_sqlite(tmp_path) -> None:
+    cache = EmbeddingCache(tmp_path / "embeddings")
+    key = cache_key("openai", "text-embedding-3-small", 3, "hello")
+    path = cache.path_for(key)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "key": key,
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "dimensions": 3,
+                "embedding": [0.1, 0.2, 0.3],
+                "created_at": "2026-09-14T00:00:00Z",
+            }
+        )
+    )
+
+    first = cache.migrate_legacy()
+    assert path.exists()
+    result = cache.migrate_legacy(delete=True)
+
+    assert first.scanned == 1
+    assert first.imported == 1
+    assert first.deleted == 0
+    assert result.scanned == 1
+    assert result.imported == 0
+    assert result.existing == 1
+    assert result.deleted == 1
+    assert not path.exists()
+    assert cache.get("openai", "text-embedding-3-small", 3, "hello") == pytest.approx(
+        [0.1, 0.2, 0.3]
+    )
+
+
+def test_legacy_job_journal_compacts_to_cache_references(tmp_path) -> None:
+    source = FakeDatasetSource(rows=[{"text": "hello"}])
+    store = JobStore(tmp_path / "jobs")
+    cache = EmbeddingCache(tmp_path / "embeddings")
+    result = start_or_resume(
+        "acme/fiqa",
+        column="text",
+        config=Config(batch_size=8, concurrency=1),
+        source=source,
+        store=store,
+        cache=cache,
+        embedder=FakeEmbedder(),
+    )
+    key = cache_key("openai", "text-embedding-3-small", 1536, "hello")
+    vector = cache.get_by_key(key, dimensions=1536)
+    assert vector is not None
+    path = store.embeddings_path(result.job.id)
+    path.write_text(
+        json.dumps(
+            {
+                "split": "train",
+                "index": 0,
+                "status": "success",
+                "cache_key": key,
+                "embedding": vector,
+            }
+        )
+        + "\n"
+    )
+    cache.clean()
+
+    compacted = store.compact_journal(result.job.id, cache)
+
+    assert compacted.bytes_after < compacted.bytes_before
+    assert '"embedding"' not in path.read_text()
+    assert cache.get_by_key(key, dimensions=1536) == pytest.approx(vector)
+    repeated = store.compact_journal(result.job.id, cache)
+    assert repeated.bytes_after == compacted.bytes_after
 
 
 def test_interior_journal_corruption_is_still_reported(tmp_path) -> None:
@@ -116,7 +203,7 @@ def test_interior_journal_corruption_is_still_reported(tmp_path) -> None:
     else:
         raise AssertionError("expected interior journal corruption to be reported")
     try:
-        store.append_embedding(job_id, 1, "k", [2.0], status=RowStatus.SUCCESS, split="train")
+        store.append_embedding(job_id, 1, "k", status=RowStatus.SUCCESS, split="train")
     except EmbedForgeError as exc:
         assert "corrupt embeddings journal" in str(exc)
     else:
@@ -142,9 +229,7 @@ def test_repeated_appends_parse_journal_once(tmp_path, monkeypatch) -> None:
             '{"split":"train","index":0,"status":"success","cache_key":"k","embedding":[1.0]}\n'
         )
         for index in range(1, count + 1):
-            store.append_embedding(
-                job_id, index, "k", [float(index)], status=RowStatus.SUCCESS, split="train"
-            )
+            store.append_embedding(job_id, index, "k", status=RowStatus.SUCCESS, split="train")
         store.close_journal(job_id)
         return parses["n"]
 
