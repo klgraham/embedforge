@@ -16,7 +16,13 @@ from embedforge.cache import EmbeddingCache, cache_key
 from embedforge.catalog import api_dimensions, estimate_cost_usd, resolve_model
 from embedforge.config import apply_overrides, load_config
 from embedforge.errors import EmbedForgeError
-from embedforge.hfdata import DatasetRequest, DatasetSource, HuggingFaceDatasetSource, LoadedDataset
+from embedforge.hfdata import (
+    DatasetRequest,
+    DatasetSource,
+    HuggingFaceDatasetSource,
+    LoadedDataset,
+    embedding_input,
+)
 from embedforge.plan import build_plan
 from embedforge.providers import EmbedBatch, Embedder, get_embedder
 from embedforge.shapes import (
@@ -295,7 +301,7 @@ def _work_items(loaded: LoadedDataset, column: str) -> list[WorkItem]:
     items: list[WorkItem] = []
     for split in loaded.splits:
         for index, row in enumerate(split.rows):
-            items.append((split.name, index, _as_text(row.get(column))))
+            items.append((split.name, index, embedding_input(row.get(column))))
     return items
 
 
@@ -534,14 +540,6 @@ def _materialize_dataset(
                 child.rmdir()
     dataset.save_to_disk(str(output))
     return output
-
-
-def _as_text(value: object) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    return str(value)
 
 
 def _key(job: Job, text: str) -> str:

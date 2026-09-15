@@ -101,7 +101,7 @@ class HuggingFaceDatasetSource:
         info = builder.info
         if license_name is None:
             raw_license = getattr(info, "license", None)
-            license_name = raw_license if isinstance(raw_license, str) else None
+            license_name = (raw_license or None) if isinstance(raw_license, str) else None
         splits = _split_counts(info)
         split_name = request.split or _default_split(splits)
         columns = _columns_from_features(getattr(info, "features", None))
@@ -211,12 +211,13 @@ def _hub_license(hub: object) -> str | None:
     card = getattr(hub, "card_data", None) or getattr(hub, "cardData", None)
     if card is None:
         return None
-    license_name = getattr(card, "license", None)
-    if isinstance(license_name, str):
-        return license_name
-    if isinstance(card, dict):
+    raw = getattr(card, "license", None)
+    if raw is None and isinstance(card, dict):
         raw = card.get("license")
-        return raw if isinstance(raw, str) else None
+    if isinstance(raw, str):
+        return raw or None
+    if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], str):
+        return raw[0] or None
     return None
 
 
@@ -285,8 +286,13 @@ def _split_row_count(request: DatasetRequest, token: str | None) -> int:
 
 
 def _text_length(value: object) -> int:
+    return len(embedding_input(value))
+
+
+def embedding_input(value: object) -> str:
+    """Normalize one source value to the text sent to an embedding provider."""
     if value is None:
-        return 0
+        return ""
     if isinstance(value, str):
-        return len(value)
-    return len(str(value))
+        return value
+    return str(value)

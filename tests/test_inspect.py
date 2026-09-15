@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from embedforge.hfdata import DatasetRequest
+from types import SimpleNamespace
+
+from embedforge.hfdata import DatasetRequest, _hub_license
 from embedforge.inspect import inspect_dataset
 from tests.fakes import FakeDatasetSource
 
@@ -37,3 +39,11 @@ def test_inspect_respects_config_and_split_request() -> None:
     assert report.split == "test"
     source.inspect(DatasetRequest(repository="org/data", config="sample", split="test"))
     assert source.inspect_calls >= 1
+
+
+def test_hub_license_accepts_a_single_value_list() -> None:
+    hub = SimpleNamespace(
+        card_data=SimpleNamespace(license=["cc-by-sa-4.0"]),
+    )
+
+    assert _hub_license(hub) == "cc-by-sa-4.0"

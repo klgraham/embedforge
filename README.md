@@ -45,6 +45,11 @@ pass `--repo owner/name`.
 `run` writes a local job under `~/.cache/embedforge/jobs/<id>/` and does not
 publish. `publish` defaults to a **private** Hugging Face dataset.
 
+If the selected source column contains an empty string or `null`, `run` keeps
+the row and writes `null` to the embedding column. Validation allows that null
+only for an empty source value. EmbedForge does not write a zero vector because
+a zero vector would look like an embedding to downstream consumers.
+
 ## Configuration
 
 ```bash
